@@ -50,11 +50,18 @@ void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, Lazer_Pin|LBIN2_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, RBIN2_Pin|LAIN1_Pin|LAIN2_Pin|LBIN1_Pin
                           |RAIN1_Pin|RAIN2_Pin|RBIN1_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(LBIN2_GPIO_Port, LBIN2_Pin, GPIO_PIN_RESET);
+  /*Configure GPIO pins : Lazer_Pin LBIN2_Pin */
+  GPIO_InitStruct.Pin = Lazer_Pin|LBIN2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pins : RBIN2_Pin LAIN1_Pin LAIN2_Pin LBIN1_Pin
                            RAIN1_Pin RAIN2_Pin RBIN1_Pin */
@@ -64,13 +71,6 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : LBIN2_Pin */
-  GPIO_InitStruct.Pin = LBIN2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(LBIN2_GPIO_Port, &GPIO_InitStruct);
 
 }
 
