@@ -89,7 +89,7 @@ void SetSpeed_R(int16_t Speed)
       {
         absSpeed = (int16_t)htim4.Init.Period;
       }
-      __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, (uint32_t)absSpeed);
+      __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, (uint32_t)absSpeed);
     }
     else
     {
@@ -187,7 +187,7 @@ int main(void)
   
   
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3);
 
   SetSpeed_L(70);
   SetSpeed_R(70);
@@ -209,6 +209,7 @@ int main(void)
       if (lastAppliedA != 0 || lastAppliedB != 0)
       {
         SetSpeed_L(0);
+        SetSpeed_R(0);
         lastAppliedA = 0;
         lastAppliedB = 0;
         SpeedA = 0;
@@ -315,9 +316,10 @@ static void ProcessJoystickPacket(char *buf)
   if (avgRy > -deadzone && avgRy < deadzone) avgRy = 0;
 
   /* map -100..100 to -Period..Period */
-  int16_t period = (int16_t)(htim3.Init.Period);
-  int16_t sA = (int16_t)((avgLy * period) / 100);
-  int16_t sB = (int16_t)((avgRy * period) / 100);
+  int16_t periodL = (int16_t)(htim3.Init.Period);
+  int16_t periodR = (int16_t)(htim4.Init.Period);
+  int16_t sA = (int16_t)((avgLy * periodL) / 100);
+  int16_t sB = (int16_t)((avgRy * periodR) / 100);
 
   /* avoid single-packet zero glitches: require two consecutive zero packets to force zero */
   if (sA == 0)
@@ -348,16 +350,18 @@ static void ProcessJoystickPacket(char *buf)
   }
 
   /* apply small hysteresis: only update if change is significant */
-  int16_t deltaThreshold = (int16_t)(period / 100); /* ~1% */
-  if (deltaThreshold < 1) deltaThreshold = 1;
-  if ( (sA != lastAppliedA) && (abs(sA - lastAppliedA) >= deltaThreshold) )
+  int16_t deltaThresholdA = (int16_t)( (periodL>0) ? (periodL / 100) : 1 ); /* ~1% */
+  int16_t deltaThresholdB = (int16_t)( (periodR>0) ? (periodR / 100) : 1 );
+  if (deltaThresholdA < 1) deltaThresholdA = 1;
+  if (deltaThresholdB < 1) deltaThresholdB = 1;
+  if ( (sA != lastAppliedA) && (abs(sA - lastAppliedA) >= deltaThresholdA) )
   {
     SetSpeed_L(sA);
     lastAppliedA = sA;
   }
-  if ( (sB != lastAppliedB) && (abs(sB - lastAppliedB) >= deltaThreshold) )
+  if ( (sB != lastAppliedB) && (abs(sB - lastAppliedB) >= deltaThresholdB) )
   {
-    SetSpeed_L(sB);
+    SetSpeed_R(sB);
     lastAppliedB = sB;
   }
 
