@@ -18,7 +18,6 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "stm32f1xx_hal_tim.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -188,9 +187,21 @@ int main(void)
   
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3);
+  
+  for (uint8_t i = 0; i < 10; i++)
+  {
+    HAL_GPIO_WritePin(Lazer_GPIO_Port, Lazer_Pin, GPIO_PIN_SET);
+    HAL_Delay(100);
+    HAL_GPIO_WritePin(Lazer_GPIO_Port, Lazer_Pin, GPIO_PIN_RESET);
+    HAL_Delay(100);
+  }
 
-  SetSpeed_L(70);
-  SetSpeed_R(70);
+
+  SetSpeed_L(25);
+  SetSpeed_R(-25);
+  HAL_Delay(1000);
+  SetSpeed_L(0);
+  SetSpeed_R(0);
 
   HAL_UART_Receive_IT(&huart2, &rx_data, 1);
   /* USER CODE END 2 */
