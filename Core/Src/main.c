@@ -117,13 +117,14 @@ int16_t SpeedB = 0;
 /* UART packet buffer for assembling incoming bytes */
 static char uart_rx_buf[64];
 static uint8_t uart_rx_idx = 0;
+static uint8_t uart_in_frame = 0;
 /* UART ring buffer to keep ISR light */
 #define UART_RING_SIZE 128
 static volatile uint8_t uart_ring[UART_RING_SIZE];
 static volatile uint16_t uart_ring_head = 0;
 static volatile uint16_t uart_ring_tail = 0;
 /* joystick filters/state */
-#define JOY_FILTER_SIZE 2
+#define JOY_FILTER_SIZE 1
 static int16_t joyLyBuf[JOY_FILTER_SIZE];
 static int16_t joyRyBuf[JOY_FILTER_SIZE];
 static uint8_t joyFilterPos = 0;
@@ -131,9 +132,6 @@ static uint8_t joyFilterCount = 0;
 /* last applied mapped speeds (timer units) */
 static int16_t lastAppliedA = 0;
 static int16_t lastAppliedB = 0;
-/* consecutive zero counters to avoid single-packet zeroing */
-static uint8_t zeroCountA = 0;
-static uint8_t zeroCountB = 0;
 /* watchdog timeout (ms): if no valid joystick packet within this, stop motors */
 #define JOY_TIMEOUT_MS 500U
 static uint32_t last_valid_rx_tick = 0;
@@ -157,19 +155,33 @@ static void ProcessUartBytes(void)
     uint8_t byte = uart_ring[uart_ring_tail];
     uart_ring_tail = (uint16_t)((uart_ring_tail + 1) % UART_RING_SIZE);
 
+    if (byte == '[')
+    {
+      uart_in_frame = 1;
+      uart_rx_idx = 0;
+    }
+
+    if (!uart_in_frame)
+    {
+      continue;
+    }
+
     if (uart_rx_idx < (uint8_t)(sizeof(uart_rx_buf) - 1))
     {
       uart_rx_buf[uart_rx_idx++] = (char)byte;
       uart_rx_buf[uart_rx_idx] = '\0';
-      if ((char)byte == ']')
+
+      if (byte == ']')
       {
         ProcessJoystickPacket(uart_rx_buf);
+        uart_in_frame = 0;
         uart_rx_idx = 0;
         uart_rx_buf[0] = '\0';
       }
     }
     else
     {
+      uart_in_frame = 0;
       uart_rx_idx = 0;
       uart_rx_buf[0] = '\0';
     }
@@ -312,24 +324,14 @@ void SystemClock_Config(void)
 static void ProcessJoystickPacket(char *buf)
 {
   int Lx, Ly, Rx, Ry;
-  /* find last occurrence of header to avoid misalignment */
-  char *start = NULL;
-  char *psearch = buf;
-  while (1)
-  {
-    char *f = strstr(psearch, "[j,");
-    if (!f) break;
-    start = f;
-    psearch = f + 1;
-  }
-  if (!start) return;
-  char *end = strchr(start, ']');
+  if (buf[0] != '[' || buf[1] != 'j' || buf[2] != ',') return;
+  char *end = strchr(buf, ']');
   if (!end) return;
   /* parse only the substring from start to end */
   char tmpBuf[48];
-  size_t len = (size_t)(end - (start + 3)); /* after header */
+  size_t len = (size_t)(end - (buf + 3)); /* after header */
   if (len >= sizeof(tmpBuf)) return;
-  memcpy(tmpBuf, start + 3, len);
+  memcpy(tmpBuf, buf + 3, len);
   tmpBuf[len] = '\0';
   if (sscanf(tmpBuf, "%d,%d,%d,%d", &Lx, &Ly, &Rx, &Ry) != 4) return;
   /* validate ranges */
@@ -354,7 +356,7 @@ static void ProcessJoystickPacket(char *buf)
   int16_t avgRy = (int16_t)(sumRy / (int)joyFilterCount);
 
   /* apply deadzone to avoid small jitter around 0 */
-  const int deadzone = 5; /* joystick units */
+  const int deadzone = 0; /* joystick units */
   if (avgLy > -deadzone && avgLy < deadzone) avgLy = 0;
   if (avgRy > -deadzone && avgRy < deadzone) avgRy = 0;
 
@@ -364,39 +366,9 @@ static void ProcessJoystickPacket(char *buf)
   int16_t sA = (int16_t)((avgLy * periodL) / 100);
   int16_t sB = (int16_t)((avgRy * periodR) / 100);
 
-  /* avoid single-packet zero glitches: require two consecutive zero packets to force zero */
-  if (sA == 0)
-  {
-    if (lastAppliedA != 0)
-    {
-      zeroCountA++;
-      if (zeroCountA < 2) sA = lastAppliedA; /* ignore this zero */
-      else zeroCountA = 0; /* accept zero and reset counter */
-    }
-  }
-  else
-  {
-    zeroCountA = 0;
-  }
-  if (sB == 0)
-  {
-    if (lastAppliedB != 0)
-    {
-      zeroCountB++;
-      if (zeroCountB < 2) sB = lastAppliedB;
-      else zeroCountB = 0;
-    }
-  }
-  else
-  {
-    zeroCountB = 0;
-  }
-
   /* apply small hysteresis: only update if change is significant */
-  int16_t deltaThresholdA = (int16_t)( (periodL>0) ? (periodL / 100) : 1 ); /* ~1% */
-  int16_t deltaThresholdB = (int16_t)( (periodR>0) ? (periodR / 100) : 1 );
-  if (deltaThresholdA < 1) deltaThresholdA = 1;
-  if (deltaThresholdB < 1) deltaThresholdB = 1;
+  int16_t deltaThresholdA = 1;
+  int16_t deltaThresholdB = 1;
   if ( (sA != lastAppliedA) && (abs(sA - lastAppliedA) >= deltaThresholdA) )
   {
     SetSpeed_L(sA);
