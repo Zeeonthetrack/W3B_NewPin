@@ -28,7 +28,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include "oled.h"
+/* #include "oled.h" */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -38,6 +38,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define OLED_UPDATE_MS 100U
 
 /* USER CODE END PD */
 
@@ -116,6 +117,11 @@ int16_t SpeedB = 0;
 /* UART packet buffer for assembling incoming bytes */
 static char uart_rx_buf[64];
 static uint8_t uart_rx_idx = 0;
+/* UART ring buffer to keep ISR light */
+#define UART_RING_SIZE 128
+static volatile uint8_t uart_ring[UART_RING_SIZE];
+static volatile uint16_t uart_ring_head = 0;
+static volatile uint16_t uart_ring_tail = 0;
 /* joystick filters/state */
 #define JOY_FILTER_SIZE 2
 static int16_t joyLyBuf[JOY_FILTER_SIZE];
@@ -131,17 +137,44 @@ static uint8_t zeroCountB = 0;
 /* watchdog timeout (ms): if no valid joystick packet within this, stop motors */
 #define JOY_TIMEOUT_MS 500U
 static uint32_t last_valid_rx_tick = 0;
+static uint32_t last_oled_update_tick = 0;
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
+static void ProcessJoystickPacket(char *buf);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void ProcessUartBytes(void)
+{
+  while (uart_ring_tail != uart_ring_head)
+  {
+    uint8_t byte = uart_ring[uart_ring_tail];
+    uart_ring_tail = (uint16_t)((uart_ring_tail + 1) % UART_RING_SIZE);
+
+    if (uart_rx_idx < (uint8_t)(sizeof(uart_rx_buf) - 1))
+    {
+      uart_rx_buf[uart_rx_idx++] = (char)byte;
+      uart_rx_buf[uart_rx_idx] = '\0';
+      if ((char)byte == ']')
+      {
+        ProcessJoystickPacket(uart_rx_buf);
+        uart_rx_idx = 0;
+        uart_rx_buf[0] = '\0';
+      }
+    }
+    else
+    {
+      uart_rx_idx = 0;
+      uart_rx_buf[0] = '\0';
+    }
+  }
+}
 
 /* USER CODE END 0 */
 
@@ -197,9 +230,6 @@ int main(void)
   }
 
 
-  SetSpeed_L(25);
-  SetSpeed_R(-25);
-  HAL_Delay(500);
   SetSpeed_L(0);
   SetSpeed_R(0);
 
@@ -214,6 +244,8 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    /* process UART bytes outside ISR to reduce latency */
+    ProcessUartBytes();
     /* watchdog: if no valid joystick packet within JOY_TIMEOUT_MS, stop motors */
     if ((HAL_GetTick() - last_valid_rx_tick) > JOY_TIMEOUT_MS)
     {
@@ -276,7 +308,7 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-/* Parse joystick packet: format [joystick,Lx,Ly,Rx,Ry] where values are -100..100 */
+/* Parse joystick packet: format [j,Lx,Ly,Rx,Ry] where values are -100..100 */
 static void ProcessJoystickPacket(char *buf)
 {
   int Lx, Ly, Rx, Ry;
@@ -285,7 +317,7 @@ static void ProcessJoystickPacket(char *buf)
   char *psearch = buf;
   while (1)
   {
-    char *f = strstr(psearch, "[joystick,");
+    char *f = strstr(psearch, "[j,");
     if (!f) break;
     start = f;
     psearch = f + 1;
@@ -295,9 +327,9 @@ static void ProcessJoystickPacket(char *buf)
   if (!end) return;
   /* parse only the substring from start to end */
   char tmpBuf[48];
-  size_t len = (size_t)(end - (start + 10)); /* after header */
+  size_t len = (size_t)(end - (start + 3)); /* after header */
   if (len >= sizeof(tmpBuf)) return;
-  memcpy(tmpBuf, start + 10, len);
+  memcpy(tmpBuf, start + 3, len);
   tmpBuf[len] = '\0';
   if (sscanf(tmpBuf, "%d,%d,%d,%d", &Lx, &Ly, &Rx, &Ry) != 4) return;
   /* validate ranges */
@@ -378,35 +410,29 @@ static void ProcessJoystickPacket(char *buf)
 
   SpeedA = lastAppliedA;
   SpeedB = lastAppliedB;
-  /* update OLED numeric display (overwrite after labels) */
-  char out[12];
-  snprintf(out, sizeof(out), "%4d", lastAppliedA);
-  OLED_ShowString(1, 8, out);
-  snprintf(out, sizeof(out), "%4d", lastAppliedB);
-  OLED_ShowString(2, 8, out);
+  /* OLED output disabled (hardware not installed) */
+  /*
+  if ((HAL_GetTick() - last_oled_update_tick) >= OLED_UPDATE_MS)
+  {
+    last_oled_update_tick = HAL_GetTick();
+    char out[12];
+    snprintf(out, sizeof(out), "%4d", lastAppliedA);
+    OLED_ShowString(1, 8, out);
+    snprintf(out, sizeof(out), "%4d", lastAppliedB);
+    OLED_ShowString(2, 8, out);
+  }
+  */
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
   if(huart->Instance == USART2)
   {
-    /* append received byte to buffer and check for packet end ']' */
-    if (uart_rx_idx < sizeof(uart_rx_buf) - 1)
+    uint16_t next_head = (uint16_t)((uart_ring_head + 1) % UART_RING_SIZE);
+    if (next_head != uart_ring_tail)
     {
-      uart_rx_buf[uart_rx_idx++] = (char)rx_data;
-      uart_rx_buf[uart_rx_idx] = '\0';
-      if ((char)rx_data == ']')
-      {
-        ProcessJoystickPacket(uart_rx_buf);
-        uart_rx_idx = 0;
-        uart_rx_buf[0] = '\0';
-      }
-    }
-    else
-    {
-      /* overflow, reset */
-      uart_rx_idx = 0;
-      uart_rx_buf[0] = '\0';
+      uart_ring[uart_ring_head] = rx_data;
+      uart_ring_head = next_head;
     }
     /* restart receive */
     HAL_UART_Receive_IT(&huart2, &rx_data, 1);
