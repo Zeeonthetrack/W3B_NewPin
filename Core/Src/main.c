@@ -118,17 +118,19 @@ int16_t SpeedB = 0;
 static char uart_rx_buf[64];
 static uint8_t uart_rx_idx = 0;
 static uint8_t uart_in_frame = 0;
-/* UART ring buffer to keep ISR light */
-#define UART_RING_SIZE 128
-static volatile uint8_t uart_ring[UART_RING_SIZE];
-static volatile uint16_t uart_ring_head = 0;
-static volatile uint16_t uart_ring_tail = 0;
+/* mailbox: always keep only latest completed frame */
+static volatile char uart_latest_frame[64];
+static volatile uint8_t uart_latest_ready = 0;
 /* joystick filters/state */
 #define JOY_FILTER_SIZE 1
 static int16_t joyLyBuf[JOY_FILTER_SIZE];
 static int16_t joyRyBuf[JOY_FILTER_SIZE];
 static uint8_t joyFilterPos = 0;
 static uint8_t joyFilterCount = 0;
+/* minimum joystick delta (raw units) to treat as a meaningful new command */
+#define JOY_INPUT_CHANGE_THRESHOLD 2
+static int16_t lastInputLy = 32767;
+static int16_t lastInputRy = 32767;
 /* last applied mapped speeds (timer units) */
 static int16_t lastAppliedA = 0;
 static int16_t lastAppliedB = 0;
@@ -143,6 +145,7 @@ static uint32_t last_oled_update_tick = 0;
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 static void ProcessJoystickPacket(char *buf);
+static void ProcessLatestUartFrame(void);
 
 /* USER CODE END PFP */
 
@@ -150,41 +153,26 @@ static void ProcessJoystickPacket(char *buf);
 /* USER CODE BEGIN 0 */
 static void ProcessUartBytes(void)
 {
-  while (uart_ring_tail != uart_ring_head)
+  ProcessLatestUartFrame();
+}
+
+static void ProcessLatestUartFrame(void)
+{
+  char frame[64];
+  if (!uart_latest_ready)
   {
-    uint8_t byte = uart_ring[uart_ring_tail];
-    uart_ring_tail = (uint16_t)((uart_ring_tail + 1) % UART_RING_SIZE);
+    return;
+  }
 
-    if (byte == '[')
-    {
-      uart_in_frame = 1;
-      uart_rx_idx = 0;
-    }
+  __disable_irq();
+  strncpy(frame, (const char *)uart_latest_frame, sizeof(frame) - 1);
+  frame[sizeof(frame) - 1] = '\0';
+  uart_latest_ready = 0;
+  __enable_irq();
 
-    if (!uart_in_frame)
-    {
-      continue;
-    }
-
-    if (uart_rx_idx < (uint8_t)(sizeof(uart_rx_buf) - 1))
-    {
-      uart_rx_buf[uart_rx_idx++] = (char)byte;
-      uart_rx_buf[uart_rx_idx] = '\0';
-
-      if (byte == ']')
-      {
-        ProcessJoystickPacket(uart_rx_buf);
-        uart_in_frame = 0;
-        uart_rx_idx = 0;
-        uart_rx_buf[0] = '\0';
-      }
-    }
-    else
-    {
-      uart_in_frame = 0;
-      uart_rx_idx = 0;
-      uart_rx_buf[0] = '\0';
-    }
+  if (frame[0] == '[')
+  {
+    ProcessJoystickPacket(frame);
   }
 }
 
@@ -340,6 +328,17 @@ static void ProcessJoystickPacket(char *buf)
   /* valid packet received: update last valid timestamp */
   last_valid_rx_tick = HAL_GetTick();
 
+  if (lastInputLy != 32767 && lastInputRy != 32767)
+  {
+    if (abs(Ly - (int)lastInputLy) < JOY_INPUT_CHANGE_THRESHOLD &&
+        abs(Ry - (int)lastInputRy) < JOY_INPUT_CHANGE_THRESHOLD)
+    {
+      return;
+    }
+  }
+  lastInputLy = (int16_t)Ly;
+  lastInputRy = (int16_t)Ry;
+
   /* push into moving average buffers */
   joyLyBuf[joyFilterPos] = (int16_t)Ly;
   joyRyBuf[joyFilterPos] = (int16_t)Ry;
@@ -400,12 +399,39 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
   if(huart->Instance == USART2)
   {
-    uint16_t next_head = (uint16_t)((uart_ring_head + 1) % UART_RING_SIZE);
-    if (next_head != uart_ring_tail)
+    uint8_t byte = rx_data;
+
+    if (byte == '[')
     {
-      uart_ring[uart_ring_head] = rx_data;
-      uart_ring_head = next_head;
+      uart_in_frame = 1;
+      uart_rx_idx = 0;
     }
+
+    if (uart_in_frame)
+    {
+      if (uart_rx_idx < (uint8_t)(sizeof(uart_rx_buf) - 1))
+      {
+        uart_rx_buf[uart_rx_idx++] = (char)byte;
+        uart_rx_buf[uart_rx_idx] = '\0';
+
+        if (byte == ']')
+        {
+          strncpy((char *)uart_latest_frame, uart_rx_buf, sizeof(uart_latest_frame) - 1);
+          uart_latest_frame[sizeof(uart_latest_frame) - 1] = '\0';
+          uart_latest_ready = 1;
+          uart_in_frame = 0;
+          uart_rx_idx = 0;
+          uart_rx_buf[0] = '\0';
+        }
+      }
+      else
+      {
+        uart_in_frame = 0;
+        uart_rx_idx = 0;
+        uart_rx_buf[0] = '\0';
+      }
+    }
+
     /* restart receive */
     HAL_UART_Receive_IT(&huart2, &rx_data, 1);
   }
