@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "i2c.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -85,11 +86,11 @@ void SetSpeed_R(int16_t Speed)
       HAL_GPIO_WritePin(RBIN2_GPIO_Port, RBIN2_Pin, GPIO_PIN_RESET);
       /* clip to timer period */
       int16_t absSpeed = (Speed>0)?Speed:0;
-      if (htim4.Init.Period > 0 && absSpeed > (int16_t)htim4.Init.Period) 
+      if (htim3.Init.Period > 0 && absSpeed > (int16_t)htim3.Init.Period) 
       {
-        absSpeed = (int16_t)htim4.Init.Period;
+        absSpeed = (int16_t)htim3.Init.Period;
       }
-      __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, (uint32_t)absSpeed);
+      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, (uint32_t)absSpeed);
     }
     else
     {
@@ -98,11 +99,11 @@ void SetSpeed_R(int16_t Speed)
       HAL_GPIO_WritePin(RBIN1_GPIO_Port, RBIN1_Pin, GPIO_PIN_RESET);
       HAL_GPIO_WritePin(RBIN2_GPIO_Port, RBIN2_Pin, GPIO_PIN_SET);
       int absVal = abs((int)Speed);
-      if (htim4.Init.Period > 0 && absVal > (int16_t)htim4.Init.Period)
+      if (htim3.Init.Period > 0 && absVal > (int16_t)htim3.Init.Period)
       {
-        absVal = (int16_t)htim4.Init.Period;
+        absVal = (int16_t)htim3.Init.Period;
       }
-      __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, (uint32_t)absVal);
+      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, (uint32_t)absVal);
     }
 }
 /* USER CODE END PM */
@@ -137,7 +138,7 @@ static int16_t lastAppliedB = 0;
 /* watchdog timeout (ms): if no valid joystick packet within this, stop motors */
 #define JOY_TIMEOUT_MS 500U
 static uint32_t last_valid_rx_tick = 0;
-static uint32_t last_oled_update_tick = 0;
+// static uint32_t last_oled_update_tick = 0;
 
 /* USER CODE END PV */
 
@@ -210,6 +211,9 @@ int main(void)
   MX_USART2_UART_Init();
   MX_TIM3_Init();
   MX_TIM4_Init();
+  MX_TIM2_Init();
+  MX_I2C2_Init();
+  /* TIM1 kept uninitialized so PA9/PA10 remain available/idle for future debug UART */
   /* USER CODE BEGIN 2 */
   /*
   OLED_Init();
@@ -219,7 +223,9 @@ int main(void)
   
   
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+  HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
+  HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL);
   
   for (uint8_t i = 0; i < 10; i++)
   {
@@ -361,7 +367,7 @@ static void ProcessJoystickPacket(char *buf)
 
   /* map -100..100 to -Period..Period */
   int16_t periodL = (int16_t)(htim3.Init.Period);
-  int16_t periodR = (int16_t)(htim4.Init.Period);
+  int16_t periodR = (int16_t)(htim3.Init.Period);
   int16_t sA = (int16_t)((avgLy * periodL) / 100);
   int16_t sB = (int16_t)((avgRy * periodR) / 100);
 
