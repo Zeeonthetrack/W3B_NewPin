@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "i2c.h"
+#include "stm32f1xx_hal.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -29,6 +30,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "pca9685.h"
 /* #include "oled.h" */
 /* USER CODE END Includes */
 
@@ -227,6 +229,8 @@ int main(void)
   HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
   HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL);
   
+  HAL_StatusTypeDef pca_status = PCA9685_Init(&hi2c2, 0x40, 50);
+
   for (uint8_t i = 0; i < 10; i++)
   {
     HAL_GPIO_WritePin(Lazer_GPIO_Port, Lazer_Pin, GPIO_PIN_SET);
@@ -238,6 +242,18 @@ int main(void)
 
   SetSpeed_L(0);
   SetSpeed_R(0);
+
+
+  PCA9685_SetServoSpeed(&hi2c2, 0x40, 0, -95);
+  PCA9685_SetServoAngle(&hi2c2, 0x40, 1, 0, 500, 2500, 50);
+  HAL_Delay(1000);
+  PCA9685_SetServoSpeed(&hi2c2, 0x40, 0, 0);
+  HAL_Delay(1000);
+  PCA9685_SetServoSpeed(&hi2c2, 0x40, 0 , 50);
+  HAL_Delay(1000);
+  PCA9685_SetServoSpeed(&hi2c2, 0x40, 0 , 0);
+  PCA9685_SetServoAngle(&hi2c2, 0x40, 1, 180, 500, 2500, 50);
+
 
   HAL_UART_Receive_IT(&huart2, &rx_data, 1);
   /* USER CODE END 2 */
