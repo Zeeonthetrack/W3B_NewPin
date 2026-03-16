@@ -244,15 +244,15 @@ int main(void)
   SetSpeed_R(0);
 
 
-  PCA9685_SetServoSpeed(&hi2c2, 0x40, 0, -95);
-  PCA9685_SetServoAngle(&hi2c2, 0x40, 1, 0, 500, 2500, 50);
-  HAL_Delay(1000);
-  PCA9685_SetServoSpeed(&hi2c2, 0x40, 0, 0);
-  HAL_Delay(1000);
-  PCA9685_SetServoSpeed(&hi2c2, 0x40, 0 , 50);
-  HAL_Delay(1000);
-  PCA9685_SetServoSpeed(&hi2c2, 0x40, 0 , 0);
-  PCA9685_SetServoAngle(&hi2c2, 0x40, 1, 180, 500, 2500, 50);
+  // PCA9685_SetServoSpeed(&hi2c2, 0x40, 0, -95);
+  // PCA9685_SetServoAngle(&hi2c2, 0x40, 1, 0, 500, 2500, 50);
+  // HAL_Delay(1000);
+  // PCA9685_SetServoSpeed(&hi2c2, 0x40, 0, 0);
+  // HAL_Delay(1000);
+  // PCA9685_SetServoSpeed(&hi2c2, 0x40, 0 , 50);
+  // HAL_Delay(1000);
+  // PCA9685_SetServoSpeed(&hi2c2, 0x40, 0 , 0);
+  // PCA9685_SetServoAngle(&hi2c2, 0x40, 1, 180, 500, 2500, 50);
 
 
   HAL_UART_Receive_IT(&huart2, &rx_data, 1);

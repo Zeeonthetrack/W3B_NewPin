@@ -11,10 +11,25 @@ extern "C" {
 #define PCA9685_DEFAULT_ADDR_7BIT (0x40U)
 #define PCA9685_CHANNEL_COUNT      (16U)
 #define PCA9685_COUNT_MAX          (4095U)
-#define PCA9685_SERVO_MIN_US       (500U)
-#define PCA9685_SERVO_STOP_US      (1500U)
-#define PCA9685_SERVO_MAX_US       (2500U)
-#define PCA9685_SERVO_DEFAULT_HZ   (50U)
+
+/* Fixed platform settings for simple APIs */
+#define PCA9685_FIXED_ADDR_7BIT      (0x40U)
+#define PCA9685_FIXED_PWM_HZ         (50U)
+
+/* SG90 angle servo (0~180 deg) */
+#define PCA9685_SG90_MIN_PULSE_US    (1000U)
+#define PCA9685_SG90_MAX_PULSE_US    (2000U)
+
+/* MG996R continuous rotation servo */
+#define PCA9685_MG996R_MIN_PULSE_US  (500U)
+#define PCA9685_MG996R_STOP_PULSE_US (1500U)
+#define PCA9685_MG996R_MAX_PULSE_US  (2500U)
+
+/* Backward-compatible aliases */
+#define PCA9685_SERVO_MIN_US         PCA9685_MG996R_MIN_PULSE_US
+#define PCA9685_SERVO_STOP_US        PCA9685_MG996R_STOP_PULSE_US
+#define PCA9685_SERVO_MAX_US         PCA9685_MG996R_MAX_PULSE_US
+#define PCA9685_SERVO_DEFAULT_HZ     PCA9685_FIXED_PWM_HZ
 
 HAL_StatusTypeDef PCA9685_Init(I2C_HandleTypeDef *hi2c, uint8_t addr7bit, uint16_t pwmHz);
 HAL_StatusTypeDef PCA9685_SetPwmCounts(I2C_HandleTypeDef *hi2c,
@@ -42,6 +57,11 @@ HAL_StatusTypeDef PCA9685_SetServoSpeed(I2C_HandleTypeDef *hi2c,
                                          uint8_t addr7bit,
                                          uint8_t channel,
                                          int16_t speed);
+
+HAL_StatusTypeDef PCA9685_Init_Simple(void);
+HAL_StatusTypeDef PCA9685_SetServoAngle_Simple(uint8_t channel, uint16_t angleDeg);
+HAL_StatusTypeDef PCA9685_SetServoSpeed_Simple(uint8_t channel, int16_t speed);
+HAL_StatusTypeDef PCA9685_SetLED_Simple(uint8_t channel, uint8_t dutyPercent);
 
 #ifdef __cplusplus
 }

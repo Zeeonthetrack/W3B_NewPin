@@ -1,4 +1,7 @@
 #include "pca9685.h"
+#include "i2c.h"
+
+#define PCA9685_FIXED_I2C_HANDLE (&hi2c2)
 
 #define PCA9685_REG_MODE1         (0x00U)
 #define PCA9685_REG_MODE2         (0x01U)
@@ -290,4 +293,38 @@ HAL_StatusTypeDef PCA9685_SetServoSpeed(I2C_HandleTypeDef *hi2c,
                                   channel,
                                   (uint16_t)pulseUs,
                                   PCA9685_SERVO_DEFAULT_HZ);
+}
+
+HAL_StatusTypeDef PCA9685_Init_Simple(void)
+{
+  return PCA9685_Init(PCA9685_FIXED_I2C_HANDLE,
+                      PCA9685_FIXED_ADDR_7BIT,
+                      PCA9685_FIXED_PWM_HZ);
+}
+
+HAL_StatusTypeDef PCA9685_SetServoAngle_Simple(uint8_t channel, uint16_t angleDeg)
+{
+  return PCA9685_SetServoAngle(PCA9685_FIXED_I2C_HANDLE,
+                               PCA9685_FIXED_ADDR_7BIT,
+                               channel,
+                               angleDeg,
+                               PCA9685_SG90_MIN_PULSE_US,
+                               PCA9685_SG90_MAX_PULSE_US,
+                               PCA9685_FIXED_PWM_HZ);
+}
+
+HAL_StatusTypeDef PCA9685_SetServoSpeed_Simple(uint8_t channel, int16_t speed)
+{
+  return PCA9685_SetServoSpeed(PCA9685_FIXED_I2C_HANDLE,
+                               PCA9685_FIXED_ADDR_7BIT,
+                               channel,
+                               speed);
+}
+
+HAL_StatusTypeDef PCA9685_SetLED_Simple(uint8_t channel, uint8_t dutyPercent)
+{
+  return PCA9685_SetDutyPercent(PCA9685_FIXED_I2C_HANDLE,
+                                PCA9685_FIXED_ADDR_7BIT,
+                                channel,
+                                dutyPercent);
 }
