@@ -243,12 +243,12 @@ HAL_StatusTypeDef PCA9685_SetServoAngle(I2C_HandleTypeDef *hi2c,
     return HAL_ERROR;
   }
 
-  if (angleDeg > 180U)
+  if (angleDeg > PCA9685_SERVO_ANGLE_MAX_DEG)
   {
-    angleDeg = 180U;
+    angleDeg = PCA9685_SERVO_ANGLE_MAX_DEG;
   }
 
-  pulseUs = minPulseUs + (((uint32_t)(maxPulseUs - minPulseUs) * angleDeg) / 180UL);
+  pulseUs = minPulseUs + (((uint32_t)(maxPulseUs - minPulseUs) * angleDeg) / (uint32_t)PCA9685_SERVO_ANGLE_MAX_DEG);
 
   return PCA9685_SetServoPulseUs(hi2c,
                                   addr7bit,

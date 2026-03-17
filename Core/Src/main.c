@@ -137,6 +137,7 @@ static int16_t lastInputRy = 32767;
 /* last applied mapped speeds (timer units) */
 static int16_t lastAppliedA = 0;
 static int16_t lastAppliedB = 0;
+static int16_t lastServoAngle = -1;
 /* watchdog timeout (ms): if no valid joystick packet within this, stop motors */
 #define JOY_TIMEOUT_MS 500U
 static uint32_t last_valid_rx_tick = 0;
@@ -148,6 +149,7 @@ static uint32_t last_valid_rx_tick = 0;
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 static void ProcessJoystickPacket(char *buf);
+static void ProcessServoPacket(char *buf);
 static void ProcessLatestUartFrame(void);
 
 /* USER CODE END PFP */
@@ -173,9 +175,16 @@ static void ProcessLatestUartFrame(void)
   uart_latest_ready = 0;
   __enable_irq();
 
-  if (frame[0] == '[')
+  if (frame[0] == '[' && frame[1] != '\0')
   {
-    ProcessJoystickPacket(frame);
+    if (frame[1] == 'j')
+    {
+      ProcessJoystickPacket(frame);
+    }
+    else if (frame[1] == 's')
+    {
+      ProcessServoPacket(frame);
+    }
   }
 }
 
@@ -231,6 +240,12 @@ int main(void)
   
   HAL_StatusTypeDef pca_status = PCA9685_Init(&hi2c2, 0x40, 50);
 
+  PCA9685_SetServoAngle(&hi2c2, 0x40, 0, 0, 500, 2500, 50);
+  HAL_Delay(3000);
+  PCA9685_SetServoAngle(&hi2c2, 0x40, 0, 30, 500, 2500, 50);
+  HAL_Delay(3000); 
+
+
   for (uint8_t i = 0; i < 10; i++)
   {
     HAL_GPIO_WritePin(Lazer_GPIO_Port, Lazer_Pin, GPIO_PIN_SET);
@@ -243,16 +258,7 @@ int main(void)
   SetSpeed_L(0);
   SetSpeed_R(0);
 
-
-  // PCA9685_SetServoSpeed(&hi2c2, 0x40, 0, -95);
-  // PCA9685_SetServoAngle(&hi2c2, 0x40, 1, 0, 500, 2500, 50);
-  // HAL_Delay(1000);
-  // PCA9685_SetServoSpeed(&hi2c2, 0x40, 0, 0);
-  // HAL_Delay(1000);
-  // PCA9685_SetServoSpeed(&hi2c2, 0x40, 0 , 50);
-  // HAL_Delay(1000);
-  // PCA9685_SetServoSpeed(&hi2c2, 0x40, 0 , 0);
-  // PCA9685_SetServoAngle(&hi2c2, 0x40, 1, 180, 500, 2500, 50);
+  
 
 
   HAL_UART_Receive_IT(&huart2, &rx_data, 1);
@@ -415,6 +421,36 @@ static void ProcessJoystickPacket(char *buf)
     OLED_ShowString(2, 8, out);
   }
   */
+}
+
+/* Parse servo packet: format [s,x,angle] */
+static void ProcessServoPacket(char *buf)
+{
+  int secondVal;
+  if (buf[0] != '[' || buf[1] != 's' || buf[2] != ',') return;
+  char *end = strchr(buf, ']');
+  if (!end) return;
+
+  char tmpBuf[32];
+  size_t len = (size_t)(end - (buf + 3));
+  if (len >= sizeof(tmpBuf)) return;
+  memcpy(tmpBuf, buf + 3, len);
+  tmpBuf[len] = '\0';
+
+  if (sscanf(tmpBuf, "%*d,%d", &secondVal) != 1) return;
+
+  /* second value controls CH0 angle: negative->0, positive keeps raw value. */
+  int16_t targetAngle = (secondVal < 0) ? 0 : (int16_t)secondVal;
+  if (targetAngle > 270)
+  {
+    targetAngle = 270;
+  }
+
+  if (targetAngle != lastServoAngle)
+  {
+    PCA9685_SetServoAngle(&hi2c2, 0x40, 0, targetAngle, 500, 2500, 50);
+    lastServoAngle = targetAngle;
+  }
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)

@@ -30,6 +30,7 @@ extern "C" {
 #define PCA9685_SERVO_STOP_US        PCA9685_MG996R_STOP_PULSE_US
 #define PCA9685_SERVO_MAX_US         PCA9685_MG996R_MAX_PULSE_US
 #define PCA9685_SERVO_DEFAULT_HZ     PCA9685_FIXED_PWM_HZ
+#define PCA9685_SERVO_ANGLE_MAX_DEG  (270U)
 
 HAL_StatusTypeDef PCA9685_Init(I2C_HandleTypeDef *hi2c, uint8_t addr7bit, uint16_t pwmHz);
 HAL_StatusTypeDef PCA9685_SetPwmCounts(I2C_HandleTypeDef *hi2c,
