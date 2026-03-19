@@ -19,7 +19,6 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "i2c.h"
-#include "stm32f1xx_hal.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -42,6 +41,8 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define OLED_UPDATE_MS 100U
+/* Encoder calibration: left motor max measured speed in counts per second. */
+#define LEFT_ENCODER_MAX_CPS 2000
 
 /* USER CODE END PD */
 
@@ -82,10 +83,10 @@ void SetSpeed_R(int16_t Speed)
 {
     if (Speed>=0)
     {
-      HAL_GPIO_WritePin(RAIN1_GPIO_Port, RAIN1_Pin, GPIO_PIN_SET);
-      HAL_GPIO_WritePin(RAIN2_GPIO_Port, RAIN2_Pin, GPIO_PIN_RESET);
-      HAL_GPIO_WritePin(RBIN1_GPIO_Port, RBIN1_Pin, GPIO_PIN_SET);
-      HAL_GPIO_WritePin(RBIN2_GPIO_Port, RBIN2_Pin, GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(RAIN1_GPIO_Port, RAIN1_Pin, GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(RAIN2_GPIO_Port, RAIN2_Pin, GPIO_PIN_SET);
+      HAL_GPIO_WritePin(RBIN1_GPIO_Port, RBIN1_Pin, GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(RBIN2_GPIO_Port, RBIN2_Pin, GPIO_PIN_SET);
       /* clip to timer period */
       int16_t absSpeed = (Speed>0)?Speed:0;
       if (htim3.Init.Period > 0 && absSpeed > (int16_t)htim3.Init.Period) 
@@ -96,16 +97,38 @@ void SetSpeed_R(int16_t Speed)
     }
     else
     {
-      HAL_GPIO_WritePin(RAIN1_GPIO_Port, RAIN1_Pin, GPIO_PIN_RESET);
-      HAL_GPIO_WritePin(RAIN2_GPIO_Port, RAIN2_Pin, GPIO_PIN_SET);
-      HAL_GPIO_WritePin(RBIN1_GPIO_Port, RBIN1_Pin, GPIO_PIN_RESET);
-      HAL_GPIO_WritePin(RBIN2_GPIO_Port, RBIN2_Pin, GPIO_PIN_SET);
+      HAL_GPIO_WritePin(RAIN1_GPIO_Port, RAIN1_Pin, GPIO_PIN_SET);
+      HAL_GPIO_WritePin(RAIN2_GPIO_Port, RAIN2_Pin, GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(RBIN1_GPIO_Port, RBIN1_Pin, GPIO_PIN_SET);
+      HAL_GPIO_WritePin(RBIN2_GPIO_Port, RBIN2_Pin, GPIO_PIN_RESET);
       int absVal = abs((int)Speed);
       if (htim3.Init.Period > 0 && absVal > (int16_t)htim3.Init.Period)
       {
         absVal = (int16_t)htim3.Init.Period;
       }
       __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, (uint32_t)absVal);
+    }
+}
+
+void SetSpeed_H(int16_t Speed)
+{
+    if (Speed > 0)
+    {
+      /* H motor forward */
+      HAL_GPIO_WritePin(HIN1_GPIO_Port, HIN1_Pin, GPIO_PIN_SET);
+      HAL_GPIO_WritePin(HIN2_GPIO_Port, HIN2_Pin, GPIO_PIN_RESET);
+    }
+    else if (Speed < 0)
+    {
+      /* H motor reverse */
+      HAL_GPIO_WritePin(HIN1_GPIO_Port, HIN1_Pin, GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(HIN2_GPIO_Port, HIN2_Pin, GPIO_PIN_SET);
+    }
+    else
+    {
+      /* stop: both low */
+      HAL_GPIO_WritePin(HIN1_GPIO_Port, HIN1_Pin, GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(HIN2_GPIO_Port, HIN2_Pin, GPIO_PIN_RESET);
     }
 }
 /* USER CODE END PM */
@@ -126,6 +149,8 @@ static volatile char uart_latest_frame[64];
 static volatile uint8_t uart_latest_ready = 0;
 /* joystick filters/state */
 #define JOY_FILTER_SIZE 1
+/* Speed slew limiter in PWM-units per second (tune this): larger=faster response. */
+#define MOTOR_SLEW_RATE_UNITS_PER_SEC 200
 static int16_t joyLyBuf[JOY_FILTER_SIZE];
 static int16_t joyRyBuf[JOY_FILTER_SIZE];
 static uint8_t joyFilterPos = 0;
@@ -137,7 +162,10 @@ static int16_t lastInputRy = 32767;
 /* last applied mapped speeds (timer units) */
 static int16_t lastAppliedA = 0;
 static int16_t lastAppliedB = 0;
+static int16_t targetCmdA = 0;
+static int16_t targetCmdB = 0;
 static int16_t lastServoAngle = -1;
+static uint32_t last_joy_slew_tick = 0;
 /* watchdog timeout (ms): if no valid joystick packet within this, stop motors */
 #define JOY_TIMEOUT_MS 500U
 static uint32_t last_valid_rx_tick = 0;
@@ -151,6 +179,8 @@ void SystemClock_Config(void);
 static void ProcessJoystickPacket(char *buf);
 static void ProcessServoPacket(char *buf);
 static void ProcessLatestUartFrame(void);
+static int16_t GetLeftMotorSpeedPercentAbs_Encoder(void);
+static int16_t ApplySlewRateI16(int16_t current, int16_t target, uint32_t dtMs);
 
 /* USER CODE END PFP */
 
@@ -159,6 +189,69 @@ static void ProcessLatestUartFrame(void);
 static void ProcessUartBytes(void)
 {
   ProcessLatestUartFrame();
+}
+
+static int16_t GetLeftMotorSpeedPercentAbs_Encoder(void)
+{
+  static uint8_t inited = 0;
+  static uint16_t lastCnt = 0;
+  static uint32_t lastTick = 0;
+  static int16_t lastPercent = 0;
+
+  uint32_t now = HAL_GetTick();
+  uint16_t cnt = (uint16_t)__HAL_TIM_GET_COUNTER(&htim2);
+
+  if (!inited)
+  {
+    inited = 1;
+    lastCnt = cnt;
+    lastTick = now;
+    lastPercent = 0;
+    return 0;
+  }
+
+  uint32_t dtMs = now - lastTick;
+  if (dtMs < 20U)
+  {
+    return lastPercent;
+  }
+
+  int16_t deltaCnt = (int16_t)(cnt - lastCnt);
+  int32_t cps = ((int32_t)deltaCnt * 1000) / (int32_t)dtMs;
+  int32_t absCps = (cps >= 0) ? cps : -cps;
+  int32_t percent = (absCps * 100) / LEFT_ENCODER_MAX_CPS;
+
+  if (percent > 100)
+  {
+    percent = 100;
+  }
+
+  lastCnt = cnt;
+  lastTick = now;
+  lastPercent = (int16_t)percent;
+  return lastPercent;
+}
+
+static int16_t ApplySlewRateI16(int16_t current, int16_t target, uint32_t dtMs)
+{
+  int32_t diff = (int32_t)target - (int32_t)current;
+  int32_t maxStep = ((int32_t)MOTOR_SLEW_RATE_UNITS_PER_SEC * (int32_t)dtMs) / 1000;
+
+  if (maxStep < 1)
+  {
+    maxStep = 1;
+  }
+
+  if (diff > maxStep)
+  {
+    diff = maxStep;
+  }
+  else if (diff < -maxStep)
+  {
+    diff = -maxStep;
+  }
+
+  return (int16_t)((int32_t)current + diff);
 }
 
 static void ProcessLatestUartFrame(void)
@@ -224,7 +317,7 @@ int main(void)
   MX_TIM4_Init();
   MX_TIM2_Init();
   MX_I2C2_Init();
-  /* TIM1 kept uninitialized so PA9/PA10 remain available/idle for future debug UART */
+  MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
   /*
   OLED_Init();
@@ -240,24 +333,25 @@ int main(void)
   
   HAL_StatusTypeDef pca_status = PCA9685_Init(&hi2c2, 0x40, 50);
 
-  PCA9685_SetServoAngle(&hi2c2, 0x40, 0, 0, 500, 2500, 50);
-  HAL_Delay(3000);
-  PCA9685_SetServoAngle(&hi2c2, 0x40, 0, 30, 500, 2500, 50);
-  HAL_Delay(3000); 
+  // PCA9685_SetServoAngle(&hi2c2, 0x40, 0, 0, 500, 2500, 50);
+  // HAL_Delay(3000);
+  // PCA9685_SetServoAngle(&hi2c2, 0x40, 0, 30, 500, 2500, 50);
+  // HAL_Delay(3000); 
 
 
-  for (uint8_t i = 0; i < 10; i++)
+  for (uint8_t i = 0; i < 5; i++)
   {
     HAL_GPIO_WritePin(Lazer_GPIO_Port, Lazer_Pin, GPIO_PIN_SET);
     HAL_Delay(100);
     HAL_GPIO_WritePin(Lazer_GPIO_Port, Lazer_Pin, GPIO_PIN_RESET);
     HAL_Delay(100);
   }
-
+  
+  // HAL_GPIO_WritePin(Lazer_GPIO_Port, Lazer_Pin, GPIO_PIN_SET);
 
   SetSpeed_L(0);
   SetSpeed_R(0);
-
+  SetSpeed_H(50);
   
 
 
@@ -274,23 +368,54 @@ int main(void)
     /* USER CODE BEGIN 3 */
     /* process UART bytes outside ISR to reduce latency */
     ProcessUartBytes();
-    /* watchdog: if no valid joystick packet within JOY_TIMEOUT_MS, stop motors */
+    /* watchdog: if timeout, command target speed to zero (smoothed stop) */
     if ((HAL_GetTick() - last_valid_rx_tick) > JOY_TIMEOUT_MS)
     {
-      if (lastAppliedA != 0 || lastAppliedB != 0)
+      targetCmdA = 0;
+      targetCmdB = 0;
+    }
+
+    /* apply slew limiter continuously so accel/decel are both smooth */
+    {
+      uint32_t nowTick = HAL_GetTick();
+      uint32_t dtMs = (last_joy_slew_tick == 0U) ? 1U : (nowTick - last_joy_slew_tick);
+      if (dtMs > 20U)
       {
-        SetSpeed_L(0);
-        SetSpeed_R(0);
-        lastAppliedA = 0;
-        lastAppliedB = 0;
-        SpeedA = 0;
-        SpeedB = 0;
-        /*
-        OLED_ShowString(1, 8, "   0");
-        OLED_ShowString(2, 8, "   0");
-        */
+        dtMs = 20U;
+      }
+
+      if (dtMs > 0U)
+      {
+        int16_t sA = ApplySlewRateI16(lastAppliedA, targetCmdA, dtMs);
+        int16_t sB = ApplySlewRateI16(lastAppliedB, targetCmdB, dtMs);
+
+        if (sA != lastAppliedA)
+        {
+          SetSpeed_L(sA);
+          lastAppliedA = sA;
+        }
+        if (sB != lastAppliedB)
+        {
+          SetSpeed_R(sB);
+          lastAppliedB = sB;
+        }
+
+        last_joy_slew_tick = nowTick;
+        SpeedA = lastAppliedA;
+        SpeedB = lastAppliedB;
       }
     }
+
+    /* Test: laser follows left motor absolute speed from encoder (50%). */
+    {
+      int16_t leftSpeedPercentAbs = GetLeftMotorSpeedPercentAbs_Encoder();
+      HAL_GPIO_WritePin(
+        Lazer_GPIO_Port,
+        Lazer_Pin,
+        (leftSpeedPercentAbs > 50) ? GPIO_PIN_SET : GPIO_PIN_RESET
+      );
+    }
+
     HAL_Delay(1);
   }
   /* USER CODE END 3 */
@@ -356,14 +481,6 @@ static void ProcessJoystickPacket(char *buf)
   /* valid packet received: update last valid timestamp */
   last_valid_rx_tick = HAL_GetTick();
 
-  if (lastInputLy != 32767 && lastInputRy != 32767)
-  {
-    if (abs(Ly - (int)lastInputLy) < JOY_INPUT_CHANGE_THRESHOLD &&
-        abs(Ry - (int)lastInputRy) < JOY_INPUT_CHANGE_THRESHOLD)
-    {
-      return;
-    }
-  }
   lastInputLy = (int16_t)Ly;
   lastInputRy = (int16_t)Ry;
 
@@ -387,28 +504,15 @@ static void ProcessJoystickPacket(char *buf)
   if (avgLy > -deadzone && avgLy < deadzone) avgLy = 0;
   if (avgRy > -deadzone && avgRy < deadzone) avgRy = 0;
 
-  /* map -100..100 to -Period..Period */
+  /* map -100..100 to -Period..Period (target speed) */
   int16_t periodL = (int16_t)(htim3.Init.Period);
   int16_t periodR = (int16_t)(htim3.Init.Period);
-  int16_t sA = (int16_t)((avgLy * periodL) / 100);
-  int16_t sB = (int16_t)((avgRy * periodR) / 100);
+  int16_t targetA = (int16_t)((avgLy * periodL) / 100);
+  int16_t targetB = (int16_t)((avgRy * periodR) / 100);
 
-  /* apply small hysteresis: only update if change is significant */
-  int16_t deltaThresholdA = 1;
-  int16_t deltaThresholdB = 1;
-  if ( (sA != lastAppliedA) && (abs(sA - lastAppliedA) >= deltaThresholdA) )
-  {
-    SetSpeed_L(sA);
-    lastAppliedA = sA;
-  }
-  if ( (sB != lastAppliedB) && (abs(sB - lastAppliedB) >= deltaThresholdB) )
-  {
-    SetSpeed_R(sB);
-    lastAppliedB = sB;
-  }
-
-  SpeedA = lastAppliedA;
-  SpeedB = lastAppliedB;
+  /* update targets only; actual output follows targets in main loop */
+  targetCmdA = targetA;
+  targetCmdB = targetB;
   /* OLED output disabled (hardware not installed) */
   /*
   if ((HAL_GetTick() - last_oled_update_tick) >= OLED_UPDATE_MS)
