@@ -42,7 +42,8 @@
 /* USER CODE BEGIN PD */
 #define OLED_UPDATE_MS 100U
 /* Encoder calibration: left motor max measured speed in counts per second. */
-#define LEFT_ENCODER_MAX_CPS 2000
+#define LEFT_ENCODER_MAX_CPS 9400
+#define RIGHT_ENCODER_MAX_CPS 9400
 
 /* USER CODE END PD */
 
@@ -180,6 +181,7 @@ static void ProcessJoystickPacket(char *buf);
 static void ProcessServoPacket(char *buf);
 static void ProcessLatestUartFrame(void);
 static int16_t GetLeftMotorSpeedPercentAbs_Encoder(void);
+static int16_t GetRightMotorSpeedPercentAbs_Encoder(void);
 static int16_t ApplySlewRateI16(int16_t current, int16_t target, uint32_t dtMs);
 
 /* USER CODE END PFP */
@@ -220,6 +222,47 @@ static int16_t GetLeftMotorSpeedPercentAbs_Encoder(void)
   int32_t cps = ((int32_t)deltaCnt * 1000) / (int32_t)dtMs;
   int32_t absCps = (cps >= 0) ? cps : -cps;
   int32_t percent = (absCps * 100) / LEFT_ENCODER_MAX_CPS;
+
+  if (percent > 100)
+  {
+    percent = 100;
+  }
+
+  lastCnt = cnt;
+  lastTick = now;
+  lastPercent = (int16_t)percent;
+  return lastPercent;
+}
+
+static int16_t GetRightMotorSpeedPercentAbs_Encoder(void)
+{
+  static uint8_t inited = 0;
+  static uint16_t lastCnt = 0;
+  static uint32_t lastTick = 0;
+  static int16_t lastPercent = 0;
+
+  uint32_t now = HAL_GetTick();
+  uint16_t cnt = (uint16_t)__HAL_TIM_GET_COUNTER(&htim4);
+
+  if (!inited)
+  {
+    inited = 1;
+    lastCnt = cnt;
+    lastTick = now;
+    lastPercent = 0;
+    return 0;
+  }
+
+  if ((now - lastTick) < 20U)
+  {
+    return lastPercent;
+  }
+
+  uint32_t dtMs = now - lastTick;
+  int16_t deltaCnt = (int16_t)(cnt - lastCnt);
+  int32_t cps = ((int32_t)deltaCnt * 1000) / (int32_t)dtMs;
+  int32_t absCps = (cps >= 0) ? cps : -cps;
+  int32_t percent = (absCps * 100) / RIGHT_ENCODER_MAX_CPS;
 
   if (percent > 100)
   {
@@ -338,17 +381,6 @@ int main(void)
   // PCA9685_SetServoAngle(&hi2c2, 0x40, 0, 30, 500, 2500, 50);
   // HAL_Delay(3000); 
 
-
-  for (uint8_t i = 0; i < 5; i++)
-  {
-    HAL_GPIO_WritePin(Lazer_GPIO_Port, Lazer_Pin, GPIO_PIN_SET);
-    HAL_Delay(100);
-    HAL_GPIO_WritePin(Lazer_GPIO_Port, Lazer_Pin, GPIO_PIN_RESET);
-    HAL_Delay(100);
-  }
-  
-  // HAL_GPIO_WritePin(Lazer_GPIO_Port, Lazer_Pin, GPIO_PIN_SET);
-
   SetSpeed_L(0);
   SetSpeed_R(0);
   SetSpeed_H(50);
@@ -406,15 +438,9 @@ int main(void)
       }
     }
 
-    /* Test: laser follows left motor absolute speed from encoder (50%). */
-    {
-      int16_t leftSpeedPercentAbs = GetLeftMotorSpeedPercentAbs_Encoder();
-      HAL_GPIO_WritePin(
-        Lazer_GPIO_Port,
-        Lazer_Pin,
-        (leftSpeedPercentAbs > 50) ? GPIO_PIN_SET : GPIO_PIN_RESET
-      );
-    }
+    /* Keep encoder speed feedback updated (20ms windows). */
+    (void)GetLeftMotorSpeedPercentAbs_Encoder();
+    (void)GetRightMotorSpeedPercentAbs_Encoder();
 
     HAL_Delay(1);
   }
