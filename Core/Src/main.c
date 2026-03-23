@@ -29,6 +29,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include "pca9685.h"
 /* #include "oled.h" */
 /* USER CODE END Includes */
@@ -44,6 +45,23 @@
 /* Encoder calibration: left motor max measured speed in counts per second. */
 #define LEFT_ENCODER_MAX_CPS 9400
 #define RIGHT_ENCODER_MAX_CPS 9400
+
+/* Two-level speed control: 10ms control period + safety limits. */
+#define CONTROL_PERIOD_MS 10U
+#define SCURVE_MAX_ACC_CPS2 120000
+#define SCURVE_MAX_DEC_CPS2 110000
+#define SCURVE_MAX_JERK_CPS3 1800000
+#define SCURVE_TRACK_GAIN_NUM 8
+#define SCURVE_TRACK_GAIN_DEN 10
+#define SCURVE_FAST_ERR_CPS 1000
+#define SCURVE_MIN_ACC_CPS2 600
+#define SCURVE_SNAP_ERR_CPS 6
+#define SPEED_EPS_CPS 20
+#define ACC_EPS_CPS2 100
+#define STOP_HOLD_CPS 80
+#define JOY_DEADZONE_PCT 4
+#define PWM_OUT_SLEW_UP_UNITS_PER_SEC 15000
+#define PWM_OUT_SLEW_DOWN_UNITS_PER_SEC 9000
 
 /* USER CODE END PD */
 
@@ -163,10 +181,35 @@ static int16_t lastInputRy = 32767;
 /* last applied mapped speeds (timer units) */
 static int16_t lastAppliedA = 0;
 static int16_t lastAppliedB = 0;
-static int16_t targetCmdA = 0;
-static int16_t targetCmdB = 0;
+static int16_t targetPctA = 0;
+static int16_t targetPctB = 0;
 static int16_t lastServoAngle = -1;
-static uint32_t last_joy_slew_tick = 0;
+static uint32_t last_ctrl_tick = 0;
+
+typedef struct
+{
+  int32_t v_ref_cps;
+  int32_t a_ref_cps2;
+  uint8_t phase;
+} Scurve7Planner_t;
+
+typedef struct
+{
+  uint8_t inited;
+  uint16_t last_cnt;
+  uint32_t last_tick;
+  int32_t last_speed_cps;
+} EncoderObs_t;
+
+typedef struct
+{
+  Scurve7Planner_t planner;
+  EncoderObs_t enc;
+  int32_t max_cps;
+} WheelCtrl_t;
+
+static WheelCtrl_t wheelL = {0};
+static WheelCtrl_t wheelR = {0};
 /* watchdog timeout (ms): if no valid joystick packet within this, stop motors */
 #define JOY_TIMEOUT_MS 500U
 static uint32_t last_valid_rx_tick = 0;
@@ -180,9 +223,10 @@ void SystemClock_Config(void);
 static void ProcessJoystickPacket(char *buf);
 static void ProcessServoPacket(char *buf);
 static void ProcessLatestUartFrame(void);
-static int16_t GetLeftMotorSpeedPercentAbs_Encoder(void);
-static int16_t GetRightMotorSpeedPercentAbs_Encoder(void);
-static int16_t ApplySlewRateI16(int16_t current, int16_t target, uint32_t dtMs);
+static int32_t ClampI32(int32_t x, int32_t lo, int32_t hi);
+static int32_t EncoderUpdateSignedCps(TIM_HandleTypeDef *htim, EncoderObs_t *obs, uint32_t minDtMs);
+static void Scurve7Step(Scurve7Planner_t *p, int32_t target_cps, uint32_t dtMs);
+static void ControlLoopStep(uint32_t nowTick);
 
 /* USER CODE END PFP */
 
@@ -193,108 +237,220 @@ static void ProcessUartBytes(void)
   ProcessLatestUartFrame();
 }
 
-static int16_t GetLeftMotorSpeedPercentAbs_Encoder(void)
+static int32_t ClampI32(int32_t x, int32_t lo, int32_t hi)
 {
-  static uint8_t inited = 0;
-  static uint16_t lastCnt = 0;
-  static uint32_t lastTick = 0;
-  static int16_t lastPercent = 0;
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
 
+static int32_t SignI32(int32_t x)
+{
+  if (x > 0) return 1;
+  if (x < 0) return -1;
+  return 0;
+}
+
+static void WheelControllerResetToZero(WheelCtrl_t *w)
+{
+  w->planner.v_ref_cps = 0;
+  w->planner.a_ref_cps2 = 0;
+  w->planner.phase = 4;
+}
+
+static int32_t EncoderUpdateSignedCps(TIM_HandleTypeDef *htim, EncoderObs_t *obs, uint32_t minDtMs)
+{
   uint32_t now = HAL_GetTick();
-  uint16_t cnt = (uint16_t)__HAL_TIM_GET_COUNTER(&htim2);
+  uint16_t cnt = (uint16_t)__HAL_TIM_GET_COUNTER(htim);
 
-  if (!inited)
+  if (!obs->inited)
   {
-    inited = 1;
-    lastCnt = cnt;
-    lastTick = now;
-    lastPercent = 0;
+    obs->inited = 1;
+    obs->last_cnt = cnt;
+    obs->last_tick = now;
+    obs->last_speed_cps = 0;
     return 0;
   }
 
-  uint32_t dtMs = now - lastTick;
-  if (dtMs < 20U)
+  uint32_t dtMs = now - obs->last_tick;
+  if (dtMs < minDtMs)
   {
-    return lastPercent;
+    return obs->last_speed_cps;
   }
 
-  int16_t deltaCnt = (int16_t)(cnt - lastCnt);
+  int16_t deltaCnt = (int16_t)(cnt - obs->last_cnt);
   int32_t cps = ((int32_t)deltaCnt * 1000) / (int32_t)dtMs;
-  int32_t absCps = (cps >= 0) ? cps : -cps;
-  int32_t percent = (absCps * 100) / LEFT_ENCODER_MAX_CPS;
 
-  if (percent > 100)
-  {
-    percent = 100;
-  }
-
-  lastCnt = cnt;
-  lastTick = now;
-  lastPercent = (int16_t)percent;
-  return lastPercent;
+  obs->last_cnt = cnt;
+  obs->last_tick = now;
+  obs->last_speed_cps = cps;
+  return cps;
 }
 
-static int16_t GetRightMotorSpeedPercentAbs_Encoder(void)
+static void Scurve7Step(Scurve7Planner_t *p, int32_t target_cps, uint32_t dtMs)
 {
-  static uint8_t inited = 0;
-  static uint16_t lastCnt = 0;
-  static uint32_t lastTick = 0;
-  static int16_t lastPercent = 0;
+  int32_t dt = (int32_t)dtMs;
+  int32_t err = target_cps - p->v_ref_cps;
 
-  uint32_t now = HAL_GetTick();
-  uint16_t cnt = (uint16_t)__HAL_TIM_GET_COUNTER(&htim4);
-
-  if (!inited)
+  /* Snap near target to remove exponential-like tail when error is tiny. */
+  if (abs(err) <= SCURVE_SNAP_ERR_CPS)
   {
-    inited = 1;
-    lastCnt = cnt;
-    lastTick = now;
-    lastPercent = 0;
-    return 0;
+    p->v_ref_cps = target_cps;
+    p->a_ref_cps2 = 0;
+    p->phase = 4;
+    return;
   }
 
-  if ((now - lastTick) < 20U)
+  int32_t acc_limit = SCURVE_MAX_ACC_CPS2;
+  /* If current speed and error have opposite sign, this is a braking phase. */
+  if ((p->v_ref_cps > 0 && err < 0) || (p->v_ref_cps < 0 && err > 0))
   {
-    return lastPercent;
+    acc_limit = SCURVE_MAX_DEC_CPS2;
   }
 
-  uint32_t dtMs = now - lastTick;
-  int16_t deltaCnt = (int16_t)(cnt - lastCnt);
-  int32_t cps = ((int32_t)deltaCnt * 1000) / (int32_t)dtMs;
-  int32_t absCps = (cps >= 0) ? cps : -cps;
-  int32_t percent = (absCps * 100) / RIGHT_ENCODER_MAX_CPS;
-
-  if (percent > 100)
+  int32_t absErr = abs(err);
+  int32_t desired_acc;
+  if (absErr >= SCURVE_FAST_ERR_CPS)
   {
-    percent = 100;
+    desired_acc = SignI32(err) * acc_limit;
+  }
+  else
+  {
+    desired_acc = (err * SCURVE_TRACK_GAIN_NUM) / SCURVE_TRACK_GAIN_DEN;
+    if (abs(desired_acc) < SCURVE_MIN_ACC_CPS2)
+    {
+      desired_acc = SignI32(err) * SCURVE_MIN_ACC_CPS2;
+    }
+  }
+  desired_acc = ClampI32(desired_acc, -acc_limit, acc_limit);
+
+  int32_t jerk_step = (SCURVE_MAX_JERK_CPS3 * dt) / 1000;
+  if (jerk_step < 1)
+  {
+    jerk_step = 1;
   }
 
-  lastCnt = cnt;
-  lastTick = now;
-  lastPercent = (int16_t)percent;
-  return lastPercent;
+  if (p->a_ref_cps2 < desired_acc)
+  {
+    p->a_ref_cps2 += jerk_step;
+    if (p->a_ref_cps2 > desired_acc) p->a_ref_cps2 = desired_acc;
+  }
+  else if (p->a_ref_cps2 > desired_acc)
+  {
+    p->a_ref_cps2 -= jerk_step;
+    if (p->a_ref_cps2 < desired_acc) p->a_ref_cps2 = desired_acc;
+  }
+
+  p->a_ref_cps2 = ClampI32(p->a_ref_cps2, -acc_limit, acc_limit);
+  p->v_ref_cps += (p->a_ref_cps2 * dt) / 1000;
+
+  if ((err > 0 && p->v_ref_cps > target_cps) || (err < 0 && p->v_ref_cps < target_cps))
+  {
+    p->v_ref_cps = target_cps;
+  }
+
+  if (abs(err) <= SPEED_EPS_CPS && abs(p->a_ref_cps2) <= ACC_EPS_CPS2)
+  {
+    p->phase = 4;
+  }
+  else if (err >= 0)
+  {
+    if (p->a_ref_cps2 < 0) p->phase = 7;
+    else if (p->a_ref_cps2 < desired_acc) p->phase = 1;
+    else if (p->a_ref_cps2 > desired_acc) p->phase = 3;
+    else p->phase = 2;
+  }
+  else
+  {
+    if (p->a_ref_cps2 > 0) p->phase = 5;
+    else if (p->a_ref_cps2 > desired_acc) p->phase = 5;
+    else if (p->a_ref_cps2 < desired_acc) p->phase = 7;
+    else p->phase = 6;
+  }
 }
 
-static int16_t ApplySlewRateI16(int16_t current, int16_t target, uint32_t dtMs)
+static void ControlLoopStep(uint32_t nowTick)
 {
-  int32_t diff = (int32_t)target - (int32_t)current;
-  int32_t maxStep = ((int32_t)MOTOR_SLEW_RATE_UNITS_PER_SEC * (int32_t)dtMs) / 1000;
-
-  if (maxStep < 1)
+  if (last_ctrl_tick == 0U)
   {
-    maxStep = 1;
+    last_ctrl_tick = nowTick;
+    return;
   }
 
-  if (diff > maxStep)
+  uint32_t dtMs = nowTick - last_ctrl_tick;
+  if (dtMs < CONTROL_PERIOD_MS)
   {
-    diff = maxStep;
+    return;
   }
-  else if (diff < -maxStep)
+  if (dtMs > 100U)
   {
-    diff = -maxStep;
+    dtMs = CONTROL_PERIOD_MS;
+  }
+  last_ctrl_tick = nowTick;
+
+  if ((HAL_GetTick() - last_valid_rx_tick) > JOY_TIMEOUT_MS)
+  {
+    targetPctA = 0;
+    targetPctB = 0;
   }
 
-  return (int16_t)((int32_t)current + diff);
+  int32_t targetL = ((int32_t)targetPctA * wheelL.max_cps) / 100;
+  int32_t targetR = ((int32_t)targetPctB * wheelR.max_cps) / 100;
+  targetL = ClampI32(targetL, -wheelL.max_cps, wheelL.max_cps);
+  targetR = ClampI32(targetR, -wheelR.max_cps, wheelR.max_cps);
+
+  int32_t fbL = EncoderUpdateSignedCps(&htim2, &wheelL.enc, CONTROL_PERIOD_MS);
+  int32_t fbR = EncoderUpdateSignedCps(&htim4, &wheelR.enc, CONTROL_PERIOD_MS);
+
+  if (targetPctA == 0 && targetPctB == 0 && abs(fbL) <= STOP_HOLD_CPS && abs(fbR) <= STOP_HOLD_CPS)
+  {
+    WheelControllerResetToZero(&wheelL);
+    WheelControllerResetToZero(&wheelR);
+    SetSpeed_L(0);
+    SetSpeed_R(0);
+    lastAppliedA = 0;
+    lastAppliedB = 0;
+    SpeedA = 0;
+    SpeedB = 0;
+    return;
+  }
+
+  Scurve7Step(&wheelL.planner, targetL, dtMs);
+  Scurve7Step(&wheelR.planner, targetR, dtMs);
+
+  int16_t pwmLimit = (int16_t)htim3.Init.Period;
+  int32_t cmdL32 = (wheelL.max_cps != 0) ? ((wheelL.planner.v_ref_cps * (int32_t)pwmLimit) / wheelL.max_cps) : 0;
+  int32_t cmdR32 = (wheelR.max_cps != 0) ? ((wheelR.planner.v_ref_cps * (int32_t)pwmLimit) / wheelR.max_cps) : 0;
+  int32_t cmdL = ClampI32(cmdL32, -pwmLimit, pwmLimit);
+  int32_t cmdR = ClampI32(cmdR32, -pwmLimit, pwmLimit);
+
+  /* Final PWM slew limiter to suppress visible step changes from quantization/noise. */
+  int32_t upStep = (PWM_OUT_SLEW_UP_UNITS_PER_SEC * (int32_t)dtMs) / 1000;
+  int32_t downStep = (PWM_OUT_SLEW_DOWN_UNITS_PER_SEC * (int32_t)dtMs) / 1000;
+  if (upStep < 1)
+  {
+    upStep = 1;
+  }
+  if (downStep < 1)
+  {
+    downStep = 1;
+  }
+
+  int32_t prevL = (int32_t)lastAppliedA;
+  int32_t prevR = (int32_t)lastAppliedB;
+  int32_t stepL = ((abs(cmdL) > abs(prevL)) && (SignI32(cmdL) == SignI32(prevL))) ? upStep : downStep;
+  int32_t stepR = ((abs(cmdR) > abs(prevR)) && (SignI32(cmdR) == SignI32(prevR))) ? upStep : downStep;
+
+  cmdL = ClampI32(cmdL, prevL - stepL, prevL + stepL);
+  cmdR = ClampI32(cmdR, prevR - stepR, prevR + stepR);
+
+  SetSpeed_L((int16_t)cmdL);
+  SetSpeed_R((int16_t)cmdR);
+
+  lastAppliedA = (int16_t)cmdL;
+  lastAppliedB = (int16_t)cmdR;
+  SpeedA = (int16_t)cmdL;
+  SpeedB = (int16_t)cmdR;
 }
 
 static void ProcessLatestUartFrame(void)
@@ -371,10 +527,20 @@ int main(void)
   
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
-  HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
-  HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL);
+  if (HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  wheelL.max_cps = LEFT_ENCODER_MAX_CPS;
+  wheelR.max_cps = RIGHT_ENCODER_MAX_CPS;
   
   HAL_StatusTypeDef pca_status = PCA9685_Init(&hi2c2, 0x40, 50);
+  (void)pca_status;
 
   // PCA9685_SetServoAngle(&hi2c2, 0x40, 0, 0, 500, 2500, 50);
   // HAL_Delay(3000);
@@ -383,7 +549,7 @@ int main(void)
 
   SetSpeed_L(0);
   SetSpeed_R(0);
-  SetSpeed_H(50);
+  SetSpeed_H(0);
   
 
 
@@ -400,47 +566,8 @@ int main(void)
     /* USER CODE BEGIN 3 */
     /* process UART bytes outside ISR to reduce latency */
     ProcessUartBytes();
-    /* watchdog: if timeout, command target speed to zero (smoothed stop) */
-    if ((HAL_GetTick() - last_valid_rx_tick) > JOY_TIMEOUT_MS)
-    {
-      targetCmdA = 0;
-      targetCmdB = 0;
-    }
-
-    /* apply slew limiter continuously so accel/decel are both smooth */
-    {
-      uint32_t nowTick = HAL_GetTick();
-      uint32_t dtMs = (last_joy_slew_tick == 0U) ? 1U : (nowTick - last_joy_slew_tick);
-      if (dtMs > 20U)
-      {
-        dtMs = 20U;
-      }
-
-      if (dtMs > 0U)
-      {
-        int16_t sA = ApplySlewRateI16(lastAppliedA, targetCmdA, dtMs);
-        int16_t sB = ApplySlewRateI16(lastAppliedB, targetCmdB, dtMs);
-
-        if (sA != lastAppliedA)
-        {
-          SetSpeed_L(sA);
-          lastAppliedA = sA;
-        }
-        if (sB != lastAppliedB)
-        {
-          SetSpeed_R(sB);
-          lastAppliedB = sB;
-        }
-
-        last_joy_slew_tick = nowTick;
-        SpeedA = lastAppliedA;
-        SpeedB = lastAppliedB;
-      }
-    }
-
-    /* Keep encoder speed feedback updated (20ms windows). */
-    (void)GetLeftMotorSpeedPercentAbs_Encoder();
-    (void)GetRightMotorSpeedPercentAbs_Encoder();
+    /* 20ms dual-loop control: S-curve planner + incremental PID speed loop. */
+    ControlLoopStep(HAL_GetTick());
 
     HAL_Delay(1);
   }
@@ -526,19 +653,13 @@ static void ProcessJoystickPacket(char *buf)
   int16_t avgRy = (int16_t)(sumRy / (int)joyFilterCount);
 
   /* apply deadzone to avoid small jitter around 0 */
-  const int deadzone = 0; /* joystick units */
+  const int deadzone = JOY_DEADZONE_PCT; /* joystick percentage */
   if (avgLy > -deadzone && avgLy < deadzone) avgLy = 0;
   if (avgRy > -deadzone && avgRy < deadzone) avgRy = 0;
 
-  /* map -100..100 to -Period..Period (target speed) */
-  int16_t periodL = (int16_t)(htim3.Init.Period);
-  int16_t periodR = (int16_t)(htim3.Init.Period);
-  int16_t targetA = (int16_t)((avgLy * periodL) / 100);
-  int16_t targetB = (int16_t)((avgRy * periodR) / 100);
-
-  /* update targets only; actual output follows targets in main loop */
-  targetCmdA = targetA;
-  targetCmdB = targetB;
+  /* map -100..100 to target speed percentage for closed-loop controller */
+  targetPctA = (int16_t)ClampI32(avgLy, -100, 100);
+  targetPctB = (int16_t)ClampI32(avgRy, -100, 100);
   /* OLED output disabled (hardware not installed) */
   /*
   if ((HAL_GetTick() - last_oled_update_tick) >= OLED_UPDATE_MS)
