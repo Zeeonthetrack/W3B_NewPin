@@ -29,6 +29,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <math.h>
 #include "pca9685.h"
 #include "wheel_control.h"
@@ -65,6 +66,16 @@
 #define SERVO_TEST_SWEEP_STEP 10
 #define SERVO_TEST_HOLD_MS 2000U
 #define SERVO_TEST_STEP_DELAY_MS 500U
+
+/* [k,x,y] dual-servo control: x is q/a, y is d/u. */
+#define K_DUAL_SERVO_CHANNEL_A 4U
+#define K_DUAL_SERVO_CHANNEL_B 5U
+#define K_DUAL_SERVO_COMP_SUM_ANGLE 180
+#define K_DUAL_SERVO_CTRL_MIN_ANGLE 30
+#define K_DUAL_SERVO_CTRL_MAX_ANGLE 115
+#define K_DUAL_SERVO_INIT_ANGLE 30
+#define K_DUAL_SERVO_SPEED_DEG_PER_SEC 120
+#define K_DUAL_SERVO_STEP_PERIOD_MS 20U
 
 /* USER CODE END PD */
 
@@ -177,6 +188,11 @@ static uint8_t joyFilterPos = 0;
 static uint8_t joyFilterCount = 0;
 static int16_t lastServoAngle = -1;
 static WheelControl_t wheelControl = {0};
+static int32_t dualServoAngleA_mdeg = 0;
+static int16_t dualServoLastAppliedA = -1;
+static int8_t dualServoDir = 0;
+static uint8_t dualServoRunning = 0;
+static uint32_t dualServoLastTick = 0;
 // static uint32_t last_oled_update_tick = 0;
 
 /* USER CODE END PV */
@@ -186,9 +202,12 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 static void ProcessJoystickPacket(char *buf);
 static void ProcessServoPacket(char *buf);
-static void ProcessHMotorPacket(char *buf);
+static void ProcessDualServoPacket(char *buf);
 static void ProcessLatestUartFrame(void);
 static HAL_StatusTypeDef ServoSetAngle180(uint16_t angleDeg);
+static HAL_StatusTypeDef ServoSetAngle180ByChannel(uint8_t channel, uint16_t angleDeg);
+static HAL_StatusTypeDef DualServoApplyComplementAngleA(int16_t angleA);
+static void DualServoSyncStep(void);
 static void RunServoCalibrationTest(void);
 
 /* USER CODE END PFP */
@@ -226,12 +245,17 @@ static void ProcessLatestUartFrame(void)
     }
     else if (frame[1] == 'k')
     {
-      ProcessHMotorPacket(frame);
+      ProcessDualServoPacket(frame);
     }
   }
 }
 
 static HAL_StatusTypeDef ServoSetAngle180(uint16_t angleDeg)
+{
+  return ServoSetAngle180ByChannel(SERVO_TEST_CHANNEL, angleDeg);
+}
+
+static HAL_StatusTypeDef ServoSetAngle180ByChannel(uint8_t channel, uint16_t angleDeg)
 {
   uint32_t pulseUs;
 
@@ -246,9 +270,83 @@ static HAL_StatusTypeDef ServoSetAngle180(uint16_t angleDeg)
 
   return PCA9685_SetServoPulseUs(&hi2c2,
                                  SERVO_TEST_ADDR_7BIT,
-                                 SERVO_TEST_CHANNEL,
+                                 channel,
                                  (uint16_t)pulseUs,
                                  SERVO_TEST_PWM_HZ);
+}
+
+static HAL_StatusTypeDef DualServoApplyComplementAngleA(int16_t angleA)
+{
+  HAL_StatusTypeDef stA;
+  HAL_StatusTypeDef stB;
+  int16_t angleB;
+
+  if (angleA < K_DUAL_SERVO_CTRL_MIN_ANGLE)
+  {
+    angleA = K_DUAL_SERVO_CTRL_MIN_ANGLE;
+  }
+  if (angleA > K_DUAL_SERVO_CTRL_MAX_ANGLE)
+  {
+    angleA = K_DUAL_SERVO_CTRL_MAX_ANGLE;
+  }
+
+  angleB = (int16_t)(K_DUAL_SERVO_COMP_SUM_ANGLE - angleA);
+
+  stA = ServoSetAngle180ByChannel(K_DUAL_SERVO_CHANNEL_A, (uint16_t)angleA);
+  stB = ServoSetAngle180ByChannel(K_DUAL_SERVO_CHANNEL_B, (uint16_t)angleB);
+
+  if (stA != HAL_OK)
+  {
+    return stA;
+  }
+  return stB;
+}
+
+static void DualServoSyncStep(void)
+{
+  uint32_t nowTick;
+  uint32_t elapsedMs;
+  int32_t deltaMdeg;
+  int32_t nextMdeg;
+  int16_t nextAngleA;
+
+  if (dualServoRunning == 0U || dualServoDir == 0)
+  {
+    return;
+  }
+
+  nowTick = HAL_GetTick();
+  elapsedMs = nowTick - dualServoLastTick;
+  if (elapsedMs < K_DUAL_SERVO_STEP_PERIOD_MS)
+  {
+    return;
+  }
+  dualServoLastTick = nowTick;
+
+  deltaMdeg = (int32_t)dualServoDir * (int32_t)K_DUAL_SERVO_SPEED_DEG_PER_SEC * (int32_t)elapsedMs;
+  nextMdeg = dualServoAngleA_mdeg + deltaMdeg;
+
+  if (nextMdeg <= ((int32_t)K_DUAL_SERVO_CTRL_MIN_ANGLE * 1000))
+  {
+    nextMdeg = (int32_t)K_DUAL_SERVO_CTRL_MIN_ANGLE * 1000;
+    dualServoRunning = 0;
+    dualServoDir = 0;
+  }
+  else if (nextMdeg >= ((int32_t)K_DUAL_SERVO_CTRL_MAX_ANGLE * 1000))
+  {
+    nextMdeg = (int32_t)K_DUAL_SERVO_CTRL_MAX_ANGLE * 1000;
+    dualServoRunning = 0;
+    dualServoDir = 0;
+  }
+
+  dualServoAngleA_mdeg = nextMdeg;
+  nextAngleA = (int16_t)(dualServoAngleA_mdeg / 1000);
+
+  if (nextAngleA != dualServoLastAppliedA)
+  {
+    (void)DualServoApplyComplementAngleA(nextAngleA);
+    dualServoLastAppliedA = nextAngleA;
+  }
 }
 
 static void RunServoCalibrationTest(void)
@@ -356,6 +454,12 @@ int main(void)
   SetSpeed_L(0);
   SetSpeed_R(0);
   SetSpeed_H(0);
+  (void)DualServoApplyComplementAngleA(K_DUAL_SERVO_INIT_ANGLE);
+  dualServoAngleA_mdeg = (int32_t)K_DUAL_SERVO_INIT_ANGLE * 1000;
+  dualServoLastAppliedA = K_DUAL_SERVO_INIT_ANGLE;
+  dualServoRunning = 0;
+  dualServoDir = 0;
+  dualServoLastTick = HAL_GetTick();
   
 
 
@@ -377,6 +481,7 @@ int main(void)
     WheelControl_Step(&wheelControl, &htim2, &htim4, HAL_GetTick(), &cmdL, &cmdR);
     SetSpeed_L(cmdL);
     SetSpeed_R(cmdR);
+    DualServoSyncStep();
     SpeedA = cmdL;
     SpeedB = cmdR;
 
@@ -518,34 +623,53 @@ static void ProcessServoPacket(char *buf)
   }
 }
 
-/* Parse H motor packet: format [k,x,y], x is 'u' or 'd'.
- * When y == 'u', force stop (SetSpeed_H(0)).
- * Otherwise x controls direction: u -> HIN1=1,HIN2=0 ; d -> HIN1=0,HIN2=1.
+/* Parse dual-servo packet: format [k,x,y]
+ * x = q: A angle up (+), B angle down (-)
+ * x = a: A angle down (-), B angle up (+)
+ * y = d: run continuously with fixed speed
+ * y = u: stop at current angle
  */
-static void ProcessHMotorPacket(char *buf)
+static void ProcessDualServoPacket(char *buf)
 {
+  char dirCmdRaw;
+  char stateCmdRaw;
   char dirCmd;
-  char modeCmd;
+  char stateCmd;
 
   if (buf[0] != '[' || buf[1] != 'k' || buf[2] != ',') return;
-  if (sscanf(buf, "[k,%c,%c]", &dirCmd, &modeCmd) != 2) return;
+  if (sscanf(buf, "[k,%c,%c]", &dirCmdRaw, &stateCmdRaw) != 2) return;
 
-  if (modeCmd == 'u')
+  dirCmd = (char)tolower((int)dirCmdRaw);
+  stateCmd = (char)tolower((int)stateCmdRaw);
+
+  if (stateCmd == 'u')
   {
-    SetSpeed_H(0);
+    dualServoRunning = 0;
+    dualServoDir = 0;
+    dualServoLastTick = HAL_GetTick();
     return;
   }
 
-  if (dirCmd == 'u')
+  if (stateCmd != 'd')
   {
-    HAL_GPIO_WritePin(HIN1_GPIO_Port, HIN1_Pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(HIN2_GPIO_Port, HIN2_Pin, GPIO_PIN_RESET);
+    return;
   }
-  else if (dirCmd == 'd')
+
+  if (dirCmd == 'q')
   {
-    HAL_GPIO_WritePin(HIN1_GPIO_Port, HIN1_Pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(HIN2_GPIO_Port, HIN2_Pin, GPIO_PIN_SET);
+    dualServoDir = 1;
   }
+  else if (dirCmd == 'a')
+  {
+    dualServoDir = -1;
+  }
+  else
+  {
+    return;
+  }
+
+  dualServoRunning = 1;
+  dualServoLastTick = HAL_GetTick();
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
