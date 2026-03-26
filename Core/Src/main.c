@@ -49,6 +49,23 @@
 #define JOY_DEADZONE_PCT 4
 #define JOY_TIMEOUT_MS 500U
 
+/* Servo calibration test mode: set to 1 to run standalone servo test loop. */
+#define SERVO_TEST_ENABLE 0
+#define SERVO_TEST_ADDR_7BIT 0x40U
+#define SERVO_TEST_CHANNEL 0U
+#define SERVO_TEST_PWM_HZ 50U
+/* Calibrate with a wide range first, then narrow if mechanical limit is reached. */
+#define SERVO_TEST_MIN_PULSE_US 500U
+#define SERVO_TEST_MAX_PULSE_US 2500U
+/* Logical angle is forced to 0~180 for standard positional servo. */
+#define SERVO_TEST_LOGICAL_MAX_ANGLE 180
+#define SERVO_TEST_MIN_ANGLE 0
+#define SERVO_TEST_MID_ANGLE 90
+#define SERVO_TEST_MAX_ANGLE 180
+#define SERVO_TEST_SWEEP_STEP 10
+#define SERVO_TEST_HOLD_MS 2000U
+#define SERVO_TEST_STEP_DELAY_MS 500U
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -169,7 +186,10 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 static void ProcessJoystickPacket(char *buf);
 static void ProcessServoPacket(char *buf);
+static void ProcessHMotorPacket(char *buf);
 static void ProcessLatestUartFrame(void);
+static HAL_StatusTypeDef ServoSetAngle180(uint16_t angleDeg);
+static void RunServoCalibrationTest(void);
 
 /* USER CODE END PFP */
 
@@ -204,6 +224,58 @@ static void ProcessLatestUartFrame(void)
     {
       ProcessServoPacket(frame);
     }
+    else if (frame[1] == 'k')
+    {
+      ProcessHMotorPacket(frame);
+    }
+  }
+}
+
+static HAL_StatusTypeDef ServoSetAngle180(uint16_t angleDeg)
+{
+  uint32_t pulseUs;
+
+  if (angleDeg > SERVO_TEST_LOGICAL_MAX_ANGLE)
+  {
+    angleDeg = SERVO_TEST_LOGICAL_MAX_ANGLE;
+  }
+
+  pulseUs = SERVO_TEST_MIN_PULSE_US +
+            (((uint32_t)(SERVO_TEST_MAX_PULSE_US - SERVO_TEST_MIN_PULSE_US) * angleDeg) /
+             SERVO_TEST_LOGICAL_MAX_ANGLE);
+
+  return PCA9685_SetServoPulseUs(&hi2c2,
+                                 SERVO_TEST_ADDR_7BIT,
+                                 SERVO_TEST_CHANNEL,
+                                 (uint16_t)pulseUs,
+                                 SERVO_TEST_PWM_HZ);
+}
+
+static void RunServoCalibrationTest(void)
+{
+  int16_t angle;
+
+  /* Step 1: hold min/mid/max to quickly observe center and endpoints. */
+  (void)ServoSetAngle180(SERVO_TEST_MIN_ANGLE);
+  HAL_Delay(SERVO_TEST_HOLD_MS);
+
+  (void)ServoSetAngle180(SERVO_TEST_MID_ANGLE);
+  HAL_Delay(SERVO_TEST_HOLD_MS);
+
+  (void)ServoSetAngle180(SERVO_TEST_MAX_ANGLE);
+  HAL_Delay(SERVO_TEST_HOLD_MS);
+
+  /* Step 2: sweep up/down so you can find the practical limits. */
+  for (angle = SERVO_TEST_MIN_ANGLE; angle <= SERVO_TEST_MAX_ANGLE; angle += SERVO_TEST_SWEEP_STEP)
+  {
+    (void)ServoSetAngle180((uint16_t)angle);
+    HAL_Delay(SERVO_TEST_STEP_DELAY_MS);
+  }
+
+  for (angle = SERVO_TEST_MAX_ANGLE; angle >= SERVO_TEST_MIN_ANGLE; angle -= SERVO_TEST_SWEEP_STEP)
+  {
+    (void)ServoSetAngle180((uint16_t)angle);
+    HAL_Delay(SERVO_TEST_STEP_DELAY_MS);
   }
 }
 
@@ -274,10 +346,12 @@ int main(void)
   HAL_StatusTypeDef pca_status = PCA9685_Init(&hi2c2, 0x40, 50);
   (void)pca_status;
 
-  // PCA9685_SetServoAngle(&hi2c2, 0x40, 0, 0, 500, 2500, 50);
-  // HAL_Delay(3000);
-  // PCA9685_SetServoAngle(&hi2c2, 0x40, 0, 30, 500, 2500, 50);
-  // HAL_Delay(3000); 
+#if SERVO_TEST_ENABLE
+  while (1)
+  {
+    RunServoCalibrationTest();
+  }
+#endif
 
   SetSpeed_L(0);
   SetSpeed_R(0);
@@ -407,10 +481,11 @@ static void ProcessJoystickPacket(char *buf)
   */
 }
 
-/* Parse servo packet: format [s,x,angle] */
+/* Parse servo packet: format [s,1,x], where x is angle 0~180 for servo CH0. */
 static void ProcessServoPacket(char *buf)
 {
-  int secondVal;
+  int servoId;
+  int angleVal;
   if (buf[0] != '[' || buf[1] != 's' || buf[2] != ',') return;
   char *end = strchr(buf, ']');
   if (!end) return;
@@ -421,19 +496,55 @@ static void ProcessServoPacket(char *buf)
   memcpy(tmpBuf, buf + 3, len);
   tmpBuf[len] = '\0';
 
-  if (sscanf(tmpBuf, "%*d,%d", &secondVal) != 1) return;
+  if (sscanf(tmpBuf, "%d,%d", &servoId, &angleVal) != 2) return;
 
-  /* second value controls CH0 angle: negative->0, positive keeps raw value. */
-  int16_t targetAngle = (secondVal < 0) ? 0 : (int16_t)secondVal;
-  if (targetAngle > 270)
+  /* For now only packet [s,1,x] is accepted and mapped to PCA9685 CH0. */
+  if (servoId != 1)
   {
-    targetAngle = 270;
+    return;
+  }
+
+  /* second value controls CH0 angle: clamp to 0~180 for positional servo. */
+  int16_t targetAngle = (angleVal < 0) ? 0 : (int16_t)angleVal;
+  if (targetAngle > SERVO_TEST_LOGICAL_MAX_ANGLE)
+  {
+    targetAngle = SERVO_TEST_LOGICAL_MAX_ANGLE;
   }
 
   if (targetAngle != lastServoAngle)
   {
-    PCA9685_SetServoAngle(&hi2c2, 0x40, 0, targetAngle, 500, 2500, 50);
+    (void)ServoSetAngle180((uint16_t)targetAngle);
     lastServoAngle = targetAngle;
+  }
+}
+
+/* Parse H motor packet: format [k,x,y], x is 'u' or 'd'.
+ * When y == 'u', force stop (SetSpeed_H(0)).
+ * Otherwise x controls direction: u -> HIN1=1,HIN2=0 ; d -> HIN1=0,HIN2=1.
+ */
+static void ProcessHMotorPacket(char *buf)
+{
+  char dirCmd;
+  char modeCmd;
+
+  if (buf[0] != '[' || buf[1] != 'k' || buf[2] != ',') return;
+  if (sscanf(buf, "[k,%c,%c]", &dirCmd, &modeCmd) != 2) return;
+
+  if (modeCmd == 'u')
+  {
+    SetSpeed_H(0);
+    return;
+  }
+
+  if (dirCmd == 'u')
+  {
+    HAL_GPIO_WritePin(HIN1_GPIO_Port, HIN1_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(HIN2_GPIO_Port, HIN2_Pin, GPIO_PIN_RESET);
+  }
+  else if (dirCmd == 'd')
+  {
+    HAL_GPIO_WritePin(HIN1_GPIO_Port, HIN1_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(HIN2_GPIO_Port, HIN2_Pin, GPIO_PIN_SET);
   }
 }
 
