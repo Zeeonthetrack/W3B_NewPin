@@ -81,66 +81,121 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
+static uint16_t ScaleSpeedToPwmPeriod(int16_t speed, uint32_t srcPeriod, uint32_t dstPeriod)
+{
+  int32_t absVal = (speed >= 0) ? (int32_t)speed : -(int32_t)speed;
+  if (srcPeriod == 0U || dstPeriod == 0U)
+  {
+    return 0U;
+  }
+
+  if ((uint32_t)absVal > srcPeriod)
+  {
+    absVal = (int32_t)srcPeriod;
+  }
+
+  uint32_t scaled = ((uint32_t)absVal * dstPeriod) / srcPeriod;
+  if (scaled > dstPeriod)
+  {
+    scaled = dstPeriod;
+  }
+
+  return (uint16_t)scaled;
+}
+
+static uint16_t PwmCompareForComplementary(uint16_t duty, uint32_t period)
+{
+  if (period == 0U)
+  {
+    return 0U;
+  }
+  if (duty > period)
+  {
+    duty = (uint16_t)period;
+  }
+  return (uint16_t)(period - duty);
+}
+
+void SetSpeed_LA(int16_t Speed)
+{
+  if (Speed >= 0)
+  {
+    HAL_GPIO_WritePin(LAIN1_GPIO_Port, LAIN1_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(LAIN2_GPIO_Port, LAIN2_Pin, GPIO_PIN_RESET);
+  }
+  else
+  {
+    HAL_GPIO_WritePin(LAIN1_GPIO_Port, LAIN1_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(LAIN2_GPIO_Port, LAIN2_Pin, GPIO_PIN_SET);
+  }
+
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1,
+                        (uint32_t)ScaleSpeedToPwmPeriod(Speed, htim3.Init.Period, htim3.Init.Period));
+}
+
+void SetSpeed_LB(int16_t Speed)
+{
+  if (Speed >= 0)
+  {
+    HAL_GPIO_WritePin(LBIN1_GPIO_Port, LBIN1_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(LBIN2_GPIO_Port, LBIN2_Pin, GPIO_PIN_RESET);
+  }
+  else
+  {
+    HAL_GPIO_WritePin(LBIN1_GPIO_Port, LBIN1_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(LBIN2_GPIO_Port, LBIN2_Pin, GPIO_PIN_SET);
+  }
+
+  uint16_t duty = ScaleSpeedToPwmPeriod(Speed, htim3.Init.Period, htim1.Init.Period);
+  uint16_t cmp = PwmCompareForComplementary(duty, htim1.Init.Period);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, (uint32_t)cmp);
+}
+
+void SetSpeed_RA(int16_t Speed)
+{
+  if (Speed >= 0)
+  {
+    HAL_GPIO_WritePin(RAIN1_GPIO_Port, RAIN1_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(RAIN2_GPIO_Port, RAIN2_Pin, GPIO_PIN_SET);
+  }
+  else
+  {
+    HAL_GPIO_WritePin(RAIN1_GPIO_Port, RAIN1_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(RAIN2_GPIO_Port, RAIN2_Pin, GPIO_PIN_RESET);
+  }
+
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2,
+                        (uint32_t)ScaleSpeedToPwmPeriod(Speed, htim3.Init.Period, htim3.Init.Period));
+}
+
+void SetSpeed_RB(int16_t Speed)
+{
+  if (Speed >= 0)
+  {
+    HAL_GPIO_WritePin(RBIN1_GPIO_Port, RBIN1_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(RBIN2_GPIO_Port, RBIN2_Pin, GPIO_PIN_SET);
+  }
+  else
+  {
+    HAL_GPIO_WritePin(RBIN1_GPIO_Port, RBIN1_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(RBIN2_GPIO_Port, RBIN2_Pin, GPIO_PIN_RESET);
+  }
+
+  uint16_t duty = ScaleSpeedToPwmPeriod(Speed, htim3.Init.Period, htim1.Init.Period);
+  uint16_t cmp = PwmCompareForComplementary(duty, htim1.Init.Period);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (uint32_t)cmp);
+}
+
 void SetSpeed_L(int16_t Speed)
 {
-    if (Speed>=0)
-    {
-      HAL_GPIO_WritePin(LAIN1_GPIO_Port, LAIN1_Pin, GPIO_PIN_SET);
-      HAL_GPIO_WritePin(LAIN2_GPIO_Port, LAIN2_Pin, GPIO_PIN_RESET);
-      HAL_GPIO_WritePin(LBIN1_GPIO_Port, LBIN1_Pin, GPIO_PIN_SET);
-      HAL_GPIO_WritePin(LBIN2_GPIO_Port, LBIN2_Pin, GPIO_PIN_RESET);
-      /* clip to timer period */
-      int16_t absSpeed = (Speed>0)?Speed:0;
-      if (htim3.Init.Period > 0 && absSpeed > (int16_t)htim3.Init.Period) 
-      {
-        absSpeed = (int16_t)htim3.Init.Period;
-      }
-      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, (uint32_t)absSpeed);
-    }
-    else
-    {
-      HAL_GPIO_WritePin(LAIN1_GPIO_Port, LAIN1_Pin, GPIO_PIN_RESET);
-      HAL_GPIO_WritePin(LAIN2_GPIO_Port, LAIN2_Pin, GPIO_PIN_SET);
-      HAL_GPIO_WritePin(LBIN1_GPIO_Port, LBIN1_Pin, GPIO_PIN_RESET);
-      HAL_GPIO_WritePin(LBIN2_GPIO_Port, LBIN2_Pin, GPIO_PIN_SET);
-      int absVal = abs((int)Speed);
-      if (htim3.Init.Period > 0 && absVal > (int16_t)htim3.Init.Period)
-      {
-        absVal = (int16_t)htim3.Init.Period;
-      }
-      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, (uint32_t)absVal);
-    }
+  SetSpeed_LA(Speed);
+  SetSpeed_LB(Speed);
 }
 
 void SetSpeed_R(int16_t Speed)
 {
-    if (Speed>=0)
-    {
-      HAL_GPIO_WritePin(RAIN1_GPIO_Port, RAIN1_Pin, GPIO_PIN_RESET);
-      HAL_GPIO_WritePin(RAIN2_GPIO_Port, RAIN2_Pin, GPIO_PIN_SET);
-      HAL_GPIO_WritePin(RBIN1_GPIO_Port, RBIN1_Pin, GPIO_PIN_RESET);
-      HAL_GPIO_WritePin(RBIN2_GPIO_Port, RBIN2_Pin, GPIO_PIN_SET);
-      /* clip to timer period */
-      int16_t absSpeed = (Speed>0)?Speed:0;
-      if (htim3.Init.Period > 0 && absSpeed > (int16_t)htim3.Init.Period) 
-      {
-        absSpeed = (int16_t)htim3.Init.Period;
-      }
-      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, (uint32_t)absSpeed);
-    }
-    else
-    {
-      HAL_GPIO_WritePin(RAIN1_GPIO_Port, RAIN1_Pin, GPIO_PIN_SET);
-      HAL_GPIO_WritePin(RAIN2_GPIO_Port, RAIN2_Pin, GPIO_PIN_RESET);
-      HAL_GPIO_WritePin(RBIN1_GPIO_Port, RBIN1_Pin, GPIO_PIN_SET);
-      HAL_GPIO_WritePin(RBIN2_GPIO_Port, RBIN2_Pin, GPIO_PIN_RESET);
-      int absVal = abs((int)Speed);
-      if (htim3.Init.Period > 0 && absVal > (int16_t)htim3.Init.Period)
-      {
-        absVal = (int16_t)htim3.Init.Period;
-      }
-      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, (uint32_t)absVal);
-    }
+  SetSpeed_RA(Speed);
+  SetSpeed_RB(Speed);
 }
 
 void SetSpeed_H(int16_t Speed)
@@ -424,6 +479,10 @@ int main(void)
   
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
+  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
   if (HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL) != HAL_OK)
   {
     Error_Handler();
