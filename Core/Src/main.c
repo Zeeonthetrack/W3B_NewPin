@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "i2c.h"
+#include "stm32f1xx_hal.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -81,26 +82,39 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-static uint16_t ScaleSpeedToPwmPeriod(int16_t speed, uint32_t srcPeriod, uint32_t dstPeriod)
+static int16_t ClampSpeedPercent(int16_t speedPct)
 {
-  int32_t absVal = (speed >= 0) ? (int32_t)speed : -(int32_t)speed;
-  if (srcPeriod == 0U || dstPeriod == 0U)
+  if (speedPct > 100)
+  {
+    return 100;
+  }
+  if (speedPct < -100)
+  {
+    return -100;
+  }
+  return speedPct;
+}
+
+static uint16_t PercentToPwmAbs(int16_t speedPct, uint32_t period)
+{
+  int32_t absPct = (speedPct >= 0) ? (int32_t)speedPct : -(int32_t)speedPct;
+  if (period == 0U)
   {
     return 0U;
   }
 
-  if ((uint32_t)absVal > srcPeriod)
+  if (absPct > 100)
   {
-    absVal = (int32_t)srcPeriod;
+    absPct = 100;
   }
 
-  uint32_t scaled = ((uint32_t)absVal * dstPeriod) / srcPeriod;
-  if (scaled > dstPeriod)
+  uint32_t duty = ((uint32_t)absPct * period) / 100U;
+  if (duty > period)
   {
-    scaled = dstPeriod;
+    duty = period;
   }
 
-  return (uint16_t)scaled;
+  return (uint16_t)duty;
 }
 
 static uint16_t PwmCompareForComplementary(uint16_t duty, uint32_t period)
@@ -116,73 +130,120 @@ static uint16_t PwmCompareForComplementary(uint16_t duty, uint32_t period)
   return (uint16_t)(period - duty);
 }
 
+static int16_t PwmCmdToPercent(int16_t pwmCmd, uint32_t period)
+{
+  if (period == 0U)
+  {
+    return 0;
+  }
+
+  int32_t pct = ((int32_t)pwmCmd * 100) / (int32_t)period;
+  if (pct > 100)
+  {
+    pct = 100;
+  }
+  else if (pct < -100)
+  {
+    pct = -100;
+  }
+  return (int16_t)pct;
+}
+
 void SetSpeed_LA(int16_t Speed)
 {
-  if (Speed >= 0)
+  int16_t speedPct = ClampSpeedPercent(Speed);
+  uint16_t duty = PercentToPwmAbs(speedPct, htim3.Init.Period);
+
+  if (speedPct > 0)
   {
     HAL_GPIO_WritePin(LAIN1_GPIO_Port, LAIN1_Pin, GPIO_PIN_SET);
     HAL_GPIO_WritePin(LAIN2_GPIO_Port, LAIN2_Pin, GPIO_PIN_RESET);
   }
-  else
+  else if (speedPct < 0)
   {
     HAL_GPIO_WritePin(LAIN1_GPIO_Port, LAIN1_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(LAIN2_GPIO_Port, LAIN2_Pin, GPIO_PIN_SET);
   }
+  else
+  {
+    HAL_GPIO_WritePin(LAIN1_GPIO_Port, LAIN1_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(LAIN2_GPIO_Port, LAIN2_Pin, GPIO_PIN_RESET);
+  }
 
-  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1,
-                        (uint32_t)ScaleSpeedToPwmPeriod(Speed, htim3.Init.Period, htim3.Init.Period));
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, (uint32_t)duty);
 }
 
 void SetSpeed_LB(int16_t Speed)
 {
-  if (Speed >= 0)
+  int16_t speedPct = ClampSpeedPercent(Speed);
+  uint16_t duty = PercentToPwmAbs(speedPct, htim1.Init.Period);
+  uint16_t cmp = PwmCompareForComplementary(duty, htim1.Init.Period);
+
+  if (speedPct > 0)
   {
     HAL_GPIO_WritePin(LBIN1_GPIO_Port, LBIN1_Pin, GPIO_PIN_SET);
     HAL_GPIO_WritePin(LBIN2_GPIO_Port, LBIN2_Pin, GPIO_PIN_RESET);
   }
-  else
+  else if (speedPct < 0)
   {
     HAL_GPIO_WritePin(LBIN1_GPIO_Port, LBIN1_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(LBIN2_GPIO_Port, LBIN2_Pin, GPIO_PIN_SET);
   }
+  else
+  {
+    HAL_GPIO_WritePin(LBIN1_GPIO_Port, LBIN1_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(LBIN2_GPIO_Port, LBIN2_Pin, GPIO_PIN_RESET);
+  }
 
-  uint16_t duty = ScaleSpeedToPwmPeriod(Speed, htim3.Init.Period, htim1.Init.Period);
-  uint16_t cmp = PwmCompareForComplementary(duty, htim1.Init.Period);
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, (uint32_t)cmp);
 }
 
 void SetSpeed_RA(int16_t Speed)
 {
-  if (Speed >= 0)
+  int16_t speedPct = ClampSpeedPercent(Speed);
+  uint16_t duty = PercentToPwmAbs(speedPct, htim3.Init.Period);
+
+  if (speedPct > 0)
   {
     HAL_GPIO_WritePin(RAIN1_GPIO_Port, RAIN1_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(RAIN2_GPIO_Port, RAIN2_Pin, GPIO_PIN_SET);
   }
-  else
+  else if (speedPct < 0)
   {
     HAL_GPIO_WritePin(RAIN1_GPIO_Port, RAIN1_Pin, GPIO_PIN_SET);
     HAL_GPIO_WritePin(RAIN2_GPIO_Port, RAIN2_Pin, GPIO_PIN_RESET);
   }
+  else
+  {
+    HAL_GPIO_WritePin(RAIN1_GPIO_Port, RAIN1_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(RAIN2_GPIO_Port, RAIN2_Pin, GPIO_PIN_RESET);
+  }
 
-  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2,
-                        (uint32_t)ScaleSpeedToPwmPeriod(Speed, htim3.Init.Period, htim3.Init.Period));
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, (uint32_t)duty);
 }
 
 void SetSpeed_RB(int16_t Speed)
 {
-  if (Speed >= 0)
+  int16_t speedPct = ClampSpeedPercent(Speed);
+  uint16_t duty = PercentToPwmAbs(speedPct, htim1.Init.Period);
+  uint16_t cmp = PwmCompareForComplementary(duty, htim1.Init.Period);
+
+  if (speedPct > 0)
   {
     HAL_GPIO_WritePin(RBIN1_GPIO_Port, RBIN1_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(RBIN2_GPIO_Port, RBIN2_Pin, GPIO_PIN_SET);
   }
-  else
+  else if (speedPct < 0)
   {
     HAL_GPIO_WritePin(RBIN1_GPIO_Port, RBIN1_Pin, GPIO_PIN_SET);
     HAL_GPIO_WritePin(RBIN2_GPIO_Port, RBIN2_Pin, GPIO_PIN_RESET);
   }
+  else
+  {
+    HAL_GPIO_WritePin(RBIN1_GPIO_Port, RBIN1_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(RBIN2_GPIO_Port, RBIN2_Pin, GPIO_PIN_RESET);
+  }
 
-  uint16_t duty = ScaleSpeedToPwmPeriod(Speed, htim3.Init.Period, htim1.Init.Period);
-  uint16_t cmp = PwmCompareForComplementary(duty, htim1.Init.Period);
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (uint32_t)cmp);
 }
 
@@ -200,13 +261,14 @@ void SetSpeed_R(int16_t Speed)
 
 void SetSpeed_H(int16_t Speed)
 {
-    if (Speed > 0)
+    int16_t speedPct = ClampSpeedPercent(Speed);
+    if (speedPct > 0)
     {
       /* H motor forward */
       HAL_GPIO_WritePin(HIN1_GPIO_Port, HIN1_Pin, GPIO_PIN_SET);
       HAL_GPIO_WritePin(HIN2_GPIO_Port, HIN2_Pin, GPIO_PIN_RESET);
     }
-    else if (Speed < 0)
+    else if (speedPct < 0)
     {
       /* H motor reverse */
       HAL_GPIO_WritePin(HIN1_GPIO_Port, HIN1_Pin, GPIO_PIN_RESET);
@@ -521,7 +583,6 @@ int main(void)
   dualServoLastTick = HAL_GetTick();
   
 
-
   HAL_UART_Receive_IT(&huart2, &rx_data, 1);
   /* USER CODE END 2 */
 
@@ -538,11 +599,13 @@ int main(void)
     int16_t cmdL = 0;
     int16_t cmdR = 0;
     WheelControl_Step(&wheelControl, &htim2, &htim4, HAL_GetTick(), &cmdL, &cmdR);
-    SetSpeed_L(cmdL);
-    SetSpeed_R(cmdR);
+    int16_t cmdLPct = PwmCmdToPercent(cmdL, htim3.Init.Period);
+    int16_t cmdRPct = PwmCmdToPercent(cmdR, htim3.Init.Period);
+    SetSpeed_L(cmdLPct);
+    SetSpeed_R(cmdRPct);
     DualServoSyncStep();
-    SpeedA = cmdL;
-    SpeedB = cmdR;
+    SpeedA = cmdLPct;
+    SpeedB = cmdRPct;
 
     HAL_Delay(1);
   }
