@@ -78,9 +78,8 @@
 #define K_DUAL_SERVO_SPEED_DEG_PER_SEC 300
 #define K_DUAL_SERVO_STEP_PERIOD_MS 20U
 
-/* [k,x,y] motor speed control: x is L/R, y is d/u, driven by PCA9685 CH2. */
-#define K_MOTOR_PCA_CHANNEL 2U
-#define K_MOTOR_SPEED_PCT 40
+/* [k,x,y] mecanum lateral move: x is j/l, y is d/u, wheel speed fixed at 25%. */
+#define K_MECANUM_LATERAL_SPEED_PCT 25
 
 /* USER CODE END PD */
 
@@ -314,6 +313,8 @@ static int16_t dualServoLastAppliedA = -1;
 static int8_t dualServoDir = 0;
 static uint8_t dualServoRunning = 0;
 static uint32_t dualServoLastTick = 0;
+/* -1: left strafe, 0: stop/normal mode, +1: right strafe */
+static volatile int8_t mecanumLateralCmd = 0;
 // static uint32_t last_oled_update_tick = 0;
 
 /* USER CODE END PV */
@@ -329,6 +330,7 @@ static HAL_StatusTypeDef ServoSetAngle180(uint16_t angleDeg);
 static HAL_StatusTypeDef ServoSetAngle180ByChannel(uint8_t channel, uint16_t angleDeg);
 static HAL_StatusTypeDef DualServoApplyComplementAngleA(int16_t angleA);
 static void DualServoSyncStep(void);
+static void ApplyMecanumLateralCommand(int8_t lateralCmd, int16_t fallbackLeftPct, int16_t fallbackRightPct);
 static void RunServoCalibrationTest(void);
 
 /* USER CODE END PFP */
@@ -338,6 +340,32 @@ static void RunServoCalibrationTest(void);
 static void ProcessUartBytes(void)
 {
   ProcessLatestUartFrame();
+}
+
+static void ApplyMecanumLateralCommand(int8_t lateralCmd, int16_t fallbackLeftPct, int16_t fallbackRightPct)
+{
+  if (lateralCmd < 0)
+  {
+    /* Left strafe: FL-, RL+, FR+, RR- */
+    SetSpeed_LA(-K_MECANUM_LATERAL_SPEED_PCT);
+    SetSpeed_LB(K_MECANUM_LATERAL_SPEED_PCT);
+    SetSpeed_RA(K_MECANUM_LATERAL_SPEED_PCT);
+    SetSpeed_RB(-K_MECANUM_LATERAL_SPEED_PCT);
+    return;
+  }
+
+  if (lateralCmd > 0)
+  {
+    /* Right strafe: FL+, RL-, FR-, RR+ */
+    SetSpeed_LA(K_MECANUM_LATERAL_SPEED_PCT);
+    SetSpeed_LB(-K_MECANUM_LATERAL_SPEED_PCT);
+    SetSpeed_RA(-K_MECANUM_LATERAL_SPEED_PCT);
+    SetSpeed_RB(K_MECANUM_LATERAL_SPEED_PCT);
+    return;
+  }
+
+  SetSpeed_L(fallbackLeftPct);
+  SetSpeed_R(fallbackRightPct);
 }
 
 static void ProcessLatestUartFrame(void)
@@ -580,15 +608,12 @@ int main(void)
   SetSpeed_R(0);
   SetSpeed_H(0);
   (void)DualServoApplyComplementAngleA(K_DUAL_SERVO_INIT_ANGLE);
-  (void)PCA9685_SetServoSpeed(&hi2c2,
-                              SERVO_TEST_ADDR_7BIT,
-                              K_MOTOR_PCA_CHANNEL,
-                              0);
   dualServoAngleA_mdeg = (int32_t)K_DUAL_SERVO_INIT_ANGLE * 1000;
   dualServoLastAppliedA = K_DUAL_SERVO_INIT_ANGLE;
   dualServoRunning = 0;
   dualServoDir = 0;
   dualServoLastTick = HAL_GetTick();
+  mecanumLateralCmd = 0;
   
 
   HAL_UART_Receive_IT(&huart2, &rx_data, 1);
@@ -609,8 +634,7 @@ int main(void)
     WheelControl_Step(&wheelControl, &htim2, &htim4, HAL_GetTick(), &cmdL, &cmdR);
     int16_t cmdLPct = PwmCmdToPercent(cmdL, htim3.Init.Period);
     int16_t cmdRPct = PwmCmdToPercent(cmdR, htim3.Init.Period);
-    SetSpeed_L(cmdLPct);
-    SetSpeed_R(cmdRPct);
+    ApplyMecanumLateralCommand(mecanumLateralCmd, cmdLPct, cmdRPct);
     DualServoSyncStep();
     SpeedA = cmdLPct;
     SpeedB = cmdRPct;
@@ -753,38 +777,29 @@ static void ProcessServoPacket(char *buf)
   }
 }
 
-/* Parse bucket/motor packet: format [k,x,y]
- * Shared state y: d = run, u = stop.
- * x = a/q -> dual-servo bucket control.
- * x = L/R -> continuous motor speed control on PCA9685 CH2.
- * For lifting mechanism direction: L = clockwise, R = counterclockwise.
+/* Parse mecanum packet: format [k,x,y]
+ * x: j/l, j = left strafe, l = right strafe.
+ * y: d/u, d = press/start, u = release/stop.
+ * Movement speed is fixed to K_MECANUM_LATERAL_SPEED_PCT.
  */
 static void ProcessDualServoPacket(char *buf)
 {
-  char dirCmdRaw;
+  char moveCmdRaw;
   char stateCmdRaw;
-  char dirCmd;
+  char moveCmd;
   char stateCmd;
 
-#if (K_MOTOR_SPEED_PCT < 0) || (K_MOTOR_SPEED_PCT > 100)
-#error "K_MOTOR_SPEED_PCT must be in range 0..100"
-#endif
-
   if (buf[0] != '[' || buf[1] != 'k' || buf[2] != ',') return;
-  if (sscanf(buf, "[k,%c,%c]", &dirCmdRaw, &stateCmdRaw) != 2) return;
+  if (sscanf(buf, "[k,%c,%c]", &moveCmdRaw, &stateCmdRaw) != 2) return;
 
-  dirCmd = (char)toupper((int)dirCmdRaw);
+  moveCmd = (char)tolower((int)moveCmdRaw);
   stateCmd = (char)tolower((int)stateCmdRaw);
 
   if (stateCmd == 'u')
   {
-    (void)PCA9685_SetServoSpeed(&hi2c2,
-                                SERVO_TEST_ADDR_7BIT,
-                                K_MOTOR_PCA_CHANNEL,
-                                0);
-    dualServoRunning = 0;
-    dualServoDir = 0;
-    dualServoLastTick = HAL_GetTick();
+    mecanumLateralCmd = 0;
+    WheelControl_SetTargetsPercent(&wheelControl, 0, 0);
+    WheelControl_MarkValidRx(&wheelControl, HAL_GetTick());
     return;
   }
 
@@ -793,54 +808,19 @@ static void ProcessDualServoPacket(char *buf)
     return;
   }
 
-  if (dirCmd == 'Q')
+  if (moveCmd == 'j')
   {
-    /* Enter dual-servo mode, ensure CH2 motor is stopped. */
-    (void)PCA9685_SetServoSpeed(&hi2c2,
-                                SERVO_TEST_ADDR_7BIT,
-                                K_MOTOR_PCA_CHANNEL,
-                                0);
-    dualServoDir = 1;
-    dualServoRunning = 1;
-    dualServoLastTick = HAL_GetTick();
-    return;
-  }
-  else if (dirCmd == 'A')
-  {
-    /* Enter dual-servo mode, ensure CH2 motor is stopped. */
-    (void)PCA9685_SetServoSpeed(&hi2c2,
-                                SERVO_TEST_ADDR_7BIT,
-                                K_MOTOR_PCA_CHANNEL,
-                                0);
-    dualServoDir = -1;
-    dualServoRunning = 1;
-    dualServoLastTick = HAL_GetTick();
+    mecanumLateralCmd = -1;
+    WheelControl_SetTargetsPercent(&wheelControl, 0, 0);
+    WheelControl_MarkValidRx(&wheelControl, HAL_GetTick());
     return;
   }
 
-  if (dirCmd == 'L')
+  if (moveCmd == 'l')
   {
-    /* Enter CH2 motor mode, stop dual-servo stepping. */
-    dualServoRunning = 0;
-    dualServoDir = 0;
-    dualServoLastTick = HAL_GetTick();
-    (void)PCA9685_SetServoSpeed(&hi2c2,
-                                SERVO_TEST_ADDR_7BIT,
-                                K_MOTOR_PCA_CHANNEL,
-                                (int16_t)K_MOTOR_SPEED_PCT);
-    return;
-  }
-
-  if (dirCmd == 'R')
-  {
-    /* Enter CH2 motor mode, stop dual-servo stepping. */
-    dualServoRunning = 0;
-    dualServoDir = 0;
-    dualServoLastTick = HAL_GetTick();
-    (void)PCA9685_SetServoSpeed(&hi2c2,
-                                SERVO_TEST_ADDR_7BIT,
-                                K_MOTOR_PCA_CHANNEL,
-                                (int16_t)(-K_MOTOR_SPEED_PCT));
+    mecanumLateralCmd = 1;
+    WheelControl_SetTargetsPercent(&wheelControl, 0, 0);
+    WheelControl_MarkValidRx(&wheelControl, HAL_GetTick());
     return;
   }
 }
