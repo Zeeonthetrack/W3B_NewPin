@@ -51,6 +51,21 @@
 #define JOY_DEADZONE_PCT 4
 #define JOY_TIMEOUT_MS 500U
 
+/* Binary motor packet: [0xAA, panL, panH, tiltL, tiltH, checksum, 0x55]. */
+#define MOTOR_PACKET_HEADER 0xAAU
+#define MOTOR_PACKET_FOOTER 0x55U
+#define MOTOR_PACKET_SIZE 7U
+#define PAN_TILT_FRAME_SIZE 4U
+#define PAN_SERVO_CHANNEL 8U
+#define TILT_SERVO_CHANNEL 9U
+#define PAN_MIN_ANGLE 0U
+#define PAN_MAX_ANGLE 180U
+#define TILT_MIN_ANGLE 0U
+#define TILT_MAX_ANGLE 180U
+#define SERVO_ABS_MAX_ANGLE 270U
+#define SERVO_MIN_PULSE_US 500U
+#define SERVO_MAX_PULSE_US 2500U
+
 /* Servo calibration test mode: set to 1 to run standalone servo test loop. */
 #define SERVO_TEST_ENABLE 0
 #define SERVO_TEST_ADDR_7BIT 0x40U
@@ -68,7 +83,10 @@
 #define SERVO_TEST_HOLD_MS 2000U
 #define SERVO_TEST_STEP_DELAY_MS 500U
 
-/* [k,x,y] bucket(斗) control: x is q/a, y is d/u. */
+/* [k,x,y] shared control packet:
+ * x=q/a controls bucket dual-servo, x=j/l controls mecanum lateral move.
+ * y=d/u means press(start)/release(stop).
+ */
 #define K_DUAL_SERVO_CHANNEL_A 4U
 #define K_DUAL_SERVO_CHANNEL_B 5U
 #define K_DUAL_SERVO_COMP_SUM_ANGLE 180
@@ -78,7 +96,7 @@
 #define K_DUAL_SERVO_SPEED_DEG_PER_SEC 300
 #define K_DUAL_SERVO_STEP_PERIOD_MS 20U
 
-/* [k,x,y] mecanum lateral move: x is j/l, y is d/u, wheel speed fixed at 25%. */
+/* Mecanum lateral move speed for [k,j/l,d/u]. */
 #define K_MECANUM_LATERAL_SPEED_PCT 25
 
 /* USER CODE END PD */
@@ -297,9 +315,14 @@ int16_t SpeedB = 0;
 static char uart_rx_buf[64];
 static uint8_t uart_rx_idx = 0;
 static uint8_t uart_in_frame = 0;
+static uint8_t motor_pkt_buf[MOTOR_PACKET_SIZE];
+static uint8_t motor_pkt_idx = 0;
+static uint8_t motor_pkt_in_frame = 0;
 /* mailbox: always keep only latest completed frame */
 static volatile char uart_latest_frame[64];
 static volatile uint8_t uart_latest_ready = 0;
+static volatile uint8_t motor_latest_payload[PAN_TILT_FRAME_SIZE];
+static volatile uint8_t motor_latest_ready = 0;
 /* joystick filters/state */
 #define JOY_FILTER_SIZE 1
 static int16_t joyLyBuf[JOY_FILTER_SIZE];
@@ -325,21 +348,63 @@ void SystemClock_Config(void);
 static void ProcessJoystickPacket(char *buf);
 static void ProcessServoPacket(char *buf);
 static void ProcessDualServoPacket(char *buf);
+static void ProcessUartBytes(void);
 static void ProcessLatestUartFrame(void);
+static void ProcessLatestPanTiltPayload(void);
+static uint8_t CalculateChecksumXor(const uint8_t *data, uint8_t len);
+static void ProcessPanTiltFrame(const uint8_t frame[PAN_TILT_FRAME_SIZE]);
 static HAL_StatusTypeDef ServoSetAngle180(uint16_t angleDeg);
 static HAL_StatusTypeDef ServoSetAngle180ByChannel(uint8_t channel, uint16_t angleDeg);
+static HAL_StatusTypeDef ServoSetAngle270ByChannel(uint8_t channel, uint16_t angleDeg);
 static HAL_StatusTypeDef DualServoApplyComplementAngleA(int16_t angleA);
 static void DualServoSyncStep(void);
 static void ApplyMecanumLateralCommand(int8_t lateralCmd, int16_t fallbackLeftPct, int16_t fallbackRightPct);
+#if SERVO_TEST_ENABLE
 static void RunServoCalibrationTest(void);
+#endif
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static uint8_t CalculateChecksumXor(const uint8_t *data, uint8_t len)
+{
+  uint8_t sum = 0U;
+  uint8_t i;
+
+  if (data == NULL)
+  {
+    return 0U;
+  }
+
+  for (i = 0U; i < len; i++)
+  {
+    sum ^= data[i];
+  }
+  return sum;
+}
+
 static void ProcessUartBytes(void)
 {
   ProcessLatestUartFrame();
+  ProcessLatestPanTiltPayload();
+}
+
+static void ProcessLatestPanTiltPayload(void)
+{
+  uint8_t payload[PAN_TILT_FRAME_SIZE];
+
+  if (!motor_latest_ready)
+  {
+    return;
+  }
+
+  __disable_irq();
+  memcpy(payload, (const void *)motor_latest_payload, PAN_TILT_FRAME_SIZE);
+  motor_latest_ready = 0;
+  __enable_irq();
+
+  ProcessPanTiltFrame(payload);
 }
 
 static void ApplyMecanumLateralCommand(int8_t lateralCmd, int16_t fallbackLeftPct, int16_t fallbackRightPct)
@@ -424,6 +489,49 @@ static HAL_StatusTypeDef ServoSetAngle180ByChannel(uint8_t channel, uint16_t ang
                                  SERVO_TEST_PWM_HZ);
 }
 
+static HAL_StatusTypeDef ServoSetAngle270ByChannel(uint8_t channel, uint16_t angleDeg)
+{
+  uint32_t pulseUs;
+
+  if (angleDeg > SERVO_ABS_MAX_ANGLE)
+  {
+    angleDeg = SERVO_ABS_MAX_ANGLE;
+  }
+
+  pulseUs = SERVO_MIN_PULSE_US +
+            (((uint32_t)(SERVO_MAX_PULSE_US - SERVO_MIN_PULSE_US) * angleDeg) /
+             SERVO_ABS_MAX_ANGLE);
+
+  return PCA9685_SetServoPulseUs(&hi2c2,
+                                 SERVO_TEST_ADDR_7BIT,
+                                 channel,
+                                 (uint16_t)pulseUs,
+                                 SERVO_TEST_PWM_HZ);
+}
+
+static void ProcessPanTiltFrame(const uint8_t frame[PAN_TILT_FRAME_SIZE])
+{
+  uint16_t pan = (uint16_t)frame[0] | ((uint16_t)frame[1] << 8);
+  uint16_t tilt = (uint16_t)frame[2] | ((uint16_t)frame[3] << 8);
+
+  if (pan > PAN_MAX_ANGLE)
+  {
+    pan = PAN_MAX_ANGLE;
+  }
+
+  if (tilt < TILT_MIN_ANGLE)
+  {
+    tilt = TILT_MIN_ANGLE;
+  }
+  if (tilt > TILT_MAX_ANGLE)
+  {
+    tilt = TILT_MAX_ANGLE;
+  }
+
+  (void)ServoSetAngle270ByChannel(PAN_SERVO_CHANNEL, pan);
+  (void)ServoSetAngle270ByChannel(TILT_SERVO_CHANNEL, tilt);
+}
+
 static HAL_StatusTypeDef DualServoApplyComplementAngleA(int16_t angleA)
 {
   HAL_StatusTypeDef stA;
@@ -498,6 +606,7 @@ static void DualServoSyncStep(void)
   }
 }
 
+#if SERVO_TEST_ENABLE
 static void RunServoCalibrationTest(void)
 {
   int16_t angle;
@@ -525,6 +634,7 @@ static void RunServoCalibrationTest(void)
     HAL_Delay(SERVO_TEST_STEP_DELAY_MS);
   }
 }
+#endif
 
 /* USER CODE END 0 */
 
@@ -614,20 +724,19 @@ int main(void)
   dualServoDir = 0;
   dualServoLastTick = HAL_GetTick();
   mecanumLateralCmd = 0;
+  HAL_UART_Receive_IT(&huart2, &rx_data, 1);
   
 
-  HAL_UART_Receive_IT(&huart2, &rx_data, 1);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    /* process UART bytes outside ISR to reduce latency */
     ProcessUartBytes();
     int16_t cmdL = 0;
     int16_t cmdR = 0;
@@ -777,10 +886,9 @@ static void ProcessServoPacket(char *buf)
   }
 }
 
-/* Parse mecanum packet: format [k,x,y]
- * x: j/l, j = left strafe, l = right strafe.
+/* Parse shared packet: format [k,x,y]
+ * x: j/l for mecanum lateral; q/a for bucket dual-servo.
  * y: d/u, d = press/start, u = release/stop.
- * Movement speed is fixed to K_MECANUM_LATERAL_SPEED_PCT.
  */
 static void ProcessDualServoPacket(char *buf)
 {
@@ -797,9 +905,21 @@ static void ProcessDualServoPacket(char *buf)
 
   if (stateCmd == 'u')
   {
-    mecanumLateralCmd = 0;
-    WheelControl_SetTargetsPercent(&wheelControl, 0, 0);
-    WheelControl_MarkValidRx(&wheelControl, HAL_GetTick());
+    if (moveCmd == 'j' || moveCmd == 'l')
+    {
+      mecanumLateralCmd = 0;
+      WheelControl_SetTargetsPercent(&wheelControl, 0, 0);
+      WheelControl_MarkValidRx(&wheelControl, HAL_GetTick());
+      return;
+    }
+
+    if (moveCmd == 'q' || moveCmd == 'a')
+    {
+      dualServoRunning = 0;
+      dualServoDir = 0;
+      return;
+    }
+
     return;
   }
 
@@ -823,6 +943,22 @@ static void ProcessDualServoPacket(char *buf)
     WheelControl_MarkValidRx(&wheelControl, HAL_GetTick());
     return;
   }
+
+  if (moveCmd == 'q')
+  {
+    dualServoDir = 1;
+    dualServoRunning = 1;
+    dualServoLastTick = HAL_GetTick();
+    return;
+  }
+
+  if (moveCmd == 'a')
+  {
+    dualServoDir = -1;
+    dualServoRunning = 1;
+    dualServoLastTick = HAL_GetTick();
+    return;
+  }
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
@@ -830,6 +966,36 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
   if(huart->Instance == USART2)
   {
     uint8_t byte = rx_data;
+
+    if (byte == MOTOR_PACKET_HEADER)
+    {
+      motor_pkt_in_frame = 1;
+      motor_pkt_idx = 0;
+      motor_pkt_buf[motor_pkt_idx++] = byte;
+    }
+    else if (motor_pkt_in_frame)
+    {
+      if (motor_pkt_idx < MOTOR_PACKET_SIZE)
+      {
+        motor_pkt_buf[motor_pkt_idx++] = byte;
+      }
+
+      if (motor_pkt_idx >= MOTOR_PACKET_SIZE)
+      {
+        uint8_t checksum = motor_pkt_buf[5];
+        uint8_t footer = motor_pkt_buf[6];
+        uint8_t checksumCalc = CalculateChecksumXor(&motor_pkt_buf[1], PAN_TILT_FRAME_SIZE);
+
+        if (footer == MOTOR_PACKET_FOOTER && checksum == checksumCalc)
+        {
+          memcpy((void *)motor_latest_payload, &motor_pkt_buf[1], PAN_TILT_FRAME_SIZE);
+          motor_latest_ready = 1;
+        }
+
+        motor_pkt_in_frame = 0;
+        motor_pkt_idx = 0;
+      }
+    }
 
     if (byte == '[')
     {
