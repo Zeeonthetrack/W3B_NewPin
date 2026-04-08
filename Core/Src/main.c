@@ -50,6 +50,8 @@
 #define RIGHT_ENCODER_MAX_CPS 9400
 #define JOY_DEADZONE_PCT 4
 #define JOY_TIMEOUT_MS 500U
+#define WHEEL_SPEED_LIMIT_NUM 1
+#define WHEEL_SPEED_LIMIT_DEN 2
 
 /* Binary motor packet: [0xAA, panL, panH, tiltL, tiltH, checksum, 0x55]. */
 #define MOTOR_PACKET_HEADER 0xAAU
@@ -168,6 +170,20 @@ static int16_t PwmCmdToPercent(int16_t pwmCmd, uint32_t period)
     pct = -100;
   }
   return (int16_t)pct;
+}
+
+static int16_t ApplyWheelSpeedLimit(int16_t speedPct)
+{
+  int32_t scaled = ((int32_t)speedPct * WHEEL_SPEED_LIMIT_NUM) / WHEEL_SPEED_LIMIT_DEN;
+  if (scaled > 100)
+  {
+    scaled = 100;
+  }
+  else if (scaled < -100)
+  {
+    scaled = -100;
+  }
+  return (int16_t)scaled;
 }
 
 void SetSpeed_LA(int16_t Speed)
@@ -330,6 +346,9 @@ static int16_t joyRyBuf[JOY_FILTER_SIZE];
 static uint8_t joyFilterPos = 0;
 static uint8_t joyFilterCount = 0;
 static int16_t lastServoAngle = -1;
+static int16_t keyDriveSpeedPct = 100;
+/* -1: key backward(s), 0: idle, +1: key forward(w). */
+static int8_t keyDriveDir = 0;
 static WheelControl_t wheelControl = {0};
 static int32_t dualServoAngleA_mdeg = 0;
 static int16_t dualServoLastAppliedA = -1;
@@ -833,6 +852,9 @@ static void ProcessJoystickPacket(char *buf)
   if (avgLy > -deadzone && avgLy < deadzone) avgLy = 0;
   if (avgRy > -deadzone && avgRy < deadzone) avgRy = 0;
 
+  avgLy = ApplyWheelSpeedLimit(avgLy);
+  avgRy = ApplyWheelSpeedLimit(avgRy);
+
   /* map -100..100 to target speed percentage for closed-loop controller */
   WheelControl_SetTargetsPercent(&wheelControl, avgLy, avgRy);
   /* OLED output disabled (hardware not installed) */
@@ -849,7 +871,7 @@ static void ProcessJoystickPacket(char *buf)
   */
 }
 
-/* Parse servo packet: format [s,1,x], used for clamp control (servo CH0, angle 0~180). */
+/* Parse [s,id,x]: id=1 for clamp servo angle, id=2 for key-drive wheel speed percent. */
 static void ProcessServoPacket(char *buf)
 {
   int servoId;
@@ -866,7 +888,30 @@ static void ProcessServoPacket(char *buf)
 
   if (sscanf(tmpBuf, "%d,%d", &servoId, &angleVal) != 2) return;
 
-  /* For now only packet [s,1,x] is accepted and mapped to PCA9685 CH0. */
+  if (servoId == 2)
+  {
+    int16_t speedPct = (int16_t)angleVal;
+    if (speedPct < 0)
+    {
+      speedPct = (int16_t)(-speedPct);
+    }
+    speedPct = ClampSpeedPercent(speedPct);
+    keyDriveSpeedPct = speedPct;
+
+    if (keyDriveDir > 0)
+    {
+      WheelControl_SetTargetsPercent(&wheelControl, keyDriveSpeedPct, keyDriveSpeedPct);
+      WheelControl_MarkValidRx(&wheelControl, HAL_GetTick());
+    }
+    else if (keyDriveDir < 0)
+    {
+      WheelControl_SetTargetsPercent(&wheelControl, (int16_t)(-keyDriveSpeedPct), (int16_t)(-keyDriveSpeedPct));
+      WheelControl_MarkValidRx(&wheelControl, HAL_GetTick());
+    }
+    return;
+  }
+
+  /* Packet [s,1,x] is mapped to clamp servo control. */
   if (servoId != 1)
   {
     return;
@@ -913,6 +958,15 @@ static void ProcessDualServoPacket(char *buf)
       return;
     }
 
+    if (moveCmd == 'w' || moveCmd == 's')
+    {
+      keyDriveDir = 0;
+      mecanumLateralCmd = 0;
+      WheelControl_SetTargetsPercent(&wheelControl, 0, 0);
+      WheelControl_MarkValidRx(&wheelControl, HAL_GetTick());
+      return;
+    }
+
     if (moveCmd == 'q' || moveCmd == 'a')
     {
       dualServoRunning = 0;
@@ -940,6 +994,24 @@ static void ProcessDualServoPacket(char *buf)
   {
     mecanumLateralCmd = 1;
     WheelControl_SetTargetsPercent(&wheelControl, 0, 0);
+    WheelControl_MarkValidRx(&wheelControl, HAL_GetTick());
+    return;
+  }
+
+  if (moveCmd == 'w')
+  {
+    keyDriveDir = 1;
+    mecanumLateralCmd = 0;
+    WheelControl_SetTargetsPercent(&wheelControl, keyDriveSpeedPct, keyDriveSpeedPct);
+    WheelControl_MarkValidRx(&wheelControl, HAL_GetTick());
+    return;
+  }
+
+  if (moveCmd == 's')
+  {
+    keyDriveDir = -1;
+    mecanumLateralCmd = 0;
+    WheelControl_SetTargetsPercent(&wheelControl, (int16_t)(-keyDriveSpeedPct), (int16_t)(-keyDriveSpeedPct));
     WheelControl_MarkValidRx(&wheelControl, HAL_GetTick());
     return;
   }
