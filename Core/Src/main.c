@@ -72,6 +72,9 @@
 #define SERVO_TEST_ENABLE 0
 #define SERVO_TEST_ADDR_7BIT 0x40U
 #define SERVO_TEST_CHANNEL 0U
+#define SERVO_PACKET_ID3_CHANNEL 1U
+#define SERVO_PACKET_ID4_CHANNEL 2U
+#define SERVO_PACKET_ID5_CHANNEL 3U
 #define SERVO_TEST_PWM_HZ 50U
 /* Calibrate with a wide range first, then narrow if mechanical limit is reached. */
 #define SERVO_TEST_MIN_PULSE_US 500U
@@ -346,6 +349,9 @@ static int16_t joyRyBuf[JOY_FILTER_SIZE];
 static uint8_t joyFilterPos = 0;
 static uint8_t joyFilterCount = 0;
 static int16_t lastServoAngle = -1;
+static int16_t lastServoAngleCh1 = -1;
+static int16_t lastServoAngleCh2 = -1;
+static int16_t lastServoAngleCh3 = -1;
 static int16_t keyDriveSpeedPct = 100;
 /* -1: key backward(s), 0: idle, +1: key forward(w). */
 static int8_t keyDriveDir = 0;
@@ -871,7 +877,7 @@ static void ProcessJoystickPacket(char *buf)
   */
 }
 
-/* Parse [s,id,x]: id=1 for clamp servo angle, id=2 for key-drive wheel speed percent. */
+/* Parse [s,id,x]: id=1 clamp servo(CH0), id=2 key-drive speed, id=3 servo(CH1), id=4 servo(CH2), id=5 servo(CH3). */
 static void ProcessServoPacket(char *buf)
 {
   int servoId;
@@ -907,6 +913,54 @@ static void ProcessServoPacket(char *buf)
     {
       WheelControl_SetTargetsPercent(&wheelControl, (int16_t)(-keyDriveSpeedPct), (int16_t)(-keyDriveSpeedPct));
       WheelControl_MarkValidRx(&wheelControl, HAL_GetTick());
+    }
+    return;
+  }
+
+  if (servoId == 3)
+  {
+    int16_t targetAngle = (angleVal < 0) ? 0 : (int16_t)angleVal;
+    if (targetAngle > SERVO_TEST_LOGICAL_MAX_ANGLE)
+    {
+      targetAngle = SERVO_TEST_LOGICAL_MAX_ANGLE;
+    }
+
+    if (targetAngle != lastServoAngleCh1)
+    {
+      (void)ServoSetAngle180ByChannel(SERVO_PACKET_ID3_CHANNEL, (uint16_t)targetAngle);
+      lastServoAngleCh1 = targetAngle;
+    }
+    return;
+  }
+
+  if (servoId == 4)
+  {
+    int16_t targetAngle = (angleVal < 0) ? 0 : (int16_t)angleVal;
+    if (targetAngle > SERVO_TEST_LOGICAL_MAX_ANGLE)
+    {
+      targetAngle = SERVO_TEST_LOGICAL_MAX_ANGLE;
+    }
+
+    if (targetAngle != lastServoAngleCh2)
+    {
+      (void)ServoSetAngle180ByChannel(SERVO_PACKET_ID4_CHANNEL, (uint16_t)targetAngle);
+      lastServoAngleCh2 = targetAngle;
+    }
+    return;
+  }
+
+  if (servoId == 5)
+  {
+    int16_t targetAngle = (angleVal < 0) ? 0 : (int16_t)angleVal;
+    if (targetAngle > SERVO_TEST_LOGICAL_MAX_ANGLE)
+    {
+      targetAngle = SERVO_TEST_LOGICAL_MAX_ANGLE;
+    }
+
+    if (targetAngle != lastServoAngleCh3)
+    {
+      (void)ServoSetAngle180ByChannel(SERVO_PACKET_ID5_CHANNEL, (uint16_t)targetAngle);
+      lastServoAngleCh3 = targetAngle;
     }
     return;
   }
