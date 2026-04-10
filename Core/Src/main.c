@@ -48,10 +48,9 @@
 /* Encoder calibration: left motor max measured speed in counts per second. */
 #define LEFT_ENCODER_MAX_CPS 9400
 #define RIGHT_ENCODER_MAX_CPS 9400
-#define JOY_DEADZONE_PCT 4
+#define JOY_Y_ACTIVE_THRESHOLD_PCT 75
+#define JOY_X_ACTIVE_THRESHOLD_PCT 80
 #define JOY_TIMEOUT_MS 500U
-#define WHEEL_SPEED_LIMIT_NUM 1
-#define WHEEL_SPEED_LIMIT_DEN 2
 
 /* Binary motor packet: [0xAA, panL, panH, tiltL, tiltH, checksum, 0x55]. */
 #define MOTOR_PACKET_HEADER 0xAAU
@@ -173,20 +172,6 @@ static int16_t PwmCmdToPercent(int16_t pwmCmd, uint32_t period)
     pct = -100;
   }
   return (int16_t)pct;
-}
-
-static int16_t ApplyWheelSpeedLimit(int16_t speedPct)
-{
-  int32_t scaled = ((int32_t)speedPct * WHEEL_SPEED_LIMIT_NUM) / WHEEL_SPEED_LIMIT_DEN;
-  if (scaled > 100)
-  {
-    scaled = 100;
-  }
-  else if (scaled < -100)
-  {
-    scaled = -100;
-  }
-  return (int16_t)scaled;
 }
 
 void SetSpeed_LA(int16_t Speed)
@@ -344,7 +329,9 @@ static volatile uint8_t motor_latest_payload[PAN_TILT_FRAME_SIZE];
 static volatile uint8_t motor_latest_ready = 0;
 /* joystick filters/state */
 #define JOY_FILTER_SIZE 1
+static int16_t joyLxBuf[JOY_FILTER_SIZE];
 static int16_t joyLyBuf[JOY_FILTER_SIZE];
+static int16_t joyRxBuf[JOY_FILTER_SIZE];
 static int16_t joyRyBuf[JOY_FILTER_SIZE];
 static uint8_t joyFilterPos = 0;
 static uint8_t joyFilterCount = 0;
@@ -818,7 +805,11 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-/* Parse joystick packet: format [j,Lx,Ly,Rx,Ry], used for left/right wheel control. */
+/* Parse joystick packet: format [j,Lx,Ly,Rx,Ry].
+ * Ly/Ry: per-wheel constant speed trigger by threshold.
+ * Lx: rotate (left=CCW, right=CW) by threshold.
+ * Rx: mecanum strafe (left/right) by threshold.
+ */
 static void ProcessJoystickPacket(char *buf)
 {
   int Lx, Ly, Rx, Ry;
@@ -839,30 +830,65 @@ static void ProcessJoystickPacket(char *buf)
   WheelControl_MarkValidRx(&wheelControl, HAL_GetTick());
 
   /* push into moving average buffers */
+  joyLxBuf[joyFilterPos] = (int16_t)Lx;
   joyLyBuf[joyFilterPos] = (int16_t)Ly;
+  joyRxBuf[joyFilterPos] = (int16_t)Rx;
   joyRyBuf[joyFilterPos] = (int16_t)Ry;
   joyFilterPos = (joyFilterPos + 1) % JOY_FILTER_SIZE;
   if (joyFilterCount < JOY_FILTER_SIZE) joyFilterCount++;
 
-  int sumLy = 0, sumRy = 0;
+  int sumLx = 0, sumLy = 0, sumRx = 0, sumRy = 0;
   for (uint8_t i = 0; i < joyFilterCount; i++)
   {
+    sumLx += joyLxBuf[i];
     sumLy += joyLyBuf[i];
+    sumRx += joyRxBuf[i];
     sumRy += joyRyBuf[i];
   }
+  int16_t avgLx = (int16_t)(sumLx / (int)joyFilterCount);
   int16_t avgLy = (int16_t)(sumLy / (int)joyFilterCount);
+  int16_t avgRx = (int16_t)(sumRx / (int)joyFilterCount);
   int16_t avgRy = (int16_t)(sumRy / (int)joyFilterCount);
 
-  /* apply deadzone to avoid small jitter around 0 */
-  const int deadzone = JOY_DEADZONE_PCT; /* joystick percentage */
-  if (avgLy > -deadzone && avgLy < deadzone) avgLy = 0;
-  if (avgRy > -deadzone && avgRy < deadzone) avgRy = 0;
+  int16_t leftTargetPct = 0;
+  int16_t rightTargetPct = 0;
 
-  avgLy = ApplyWheelSpeedLimit(avgLy);
-  avgRy = ApplyWheelSpeedLimit(avgRy);
+  if (abs((int)avgLy) >= JOY_Y_ACTIVE_THRESHOLD_PCT)
+  {
+    leftTargetPct = (avgLy > 0) ? keyDriveSpeedPct : (int16_t)(-keyDriveSpeedPct);
+  }
 
-  /* map -100..100 to target speed percentage for closed-loop controller */
-  WheelControl_SetTargetsPercent(&wheelControl, avgLy, avgRy);
+  if (abs((int)avgRy) >= JOY_Y_ACTIVE_THRESHOLD_PCT)
+  {
+    rightTargetPct = (avgRy > 0) ? keyDriveSpeedPct : (int16_t)(-keyDriveSpeedPct);
+  }
+
+  if (avgLx <= -JOY_X_ACTIVE_THRESHOLD_PCT)
+  {
+    leftTargetPct = (int16_t)(-keyDriveSpeedPct);
+    rightTargetPct = keyDriveSpeedPct;
+  }
+  else if (avgLx >= JOY_X_ACTIVE_THRESHOLD_PCT)
+  {
+    leftTargetPct = keyDriveSpeedPct;
+    rightTargetPct = (int16_t)(-keyDriveSpeedPct);
+  }
+
+  if (avgRx <= -JOY_X_ACTIVE_THRESHOLD_PCT)
+  {
+    mecanumLateralCmd = -1;
+  }
+  else if (avgRx >= JOY_X_ACTIVE_THRESHOLD_PCT)
+  {
+    mecanumLateralCmd = 1;
+  }
+  else
+  {
+    mecanumLateralCmd = 0;
+  }
+
+  /* target is constant-speed level, then WheelControl applies S-curve ramp/settle. */
+  WheelControl_SetTargetsPercent(&wheelControl, leftTargetPct, rightTargetPct);
   /* OLED output disabled (hardware not installed) */
   /*
   if ((HAL_GetTick() - last_oled_update_tick) >= OLED_UPDATE_MS)
@@ -877,7 +903,7 @@ static void ProcessJoystickPacket(char *buf)
   */
 }
 
-/* Parse [s,id,x]: id=1 clamp servo(CH0), id=2 key-drive speed, id=3 servo(CH1), id=4 servo(CH2), id=5 servo(CH3). */
+/* Parse [s,id,x]: id=1 clamp servo(CH0), id=2 wheel constant speed, id=3 servo(CH1), id=4 servo(CH2), id=5 servo(CH3). */
 static void ProcessServoPacket(char *buf)
 {
   int servoId;
