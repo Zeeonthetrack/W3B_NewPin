@@ -37,7 +37,8 @@ W3B_NewPin 是华南理工大学歪比巴卜队的一个基于 STM32F103 的嵌�
    - `build/Debug/W3B_NewPin.hex`
    - `build/Debug/W3B_NewPin.bin`
 2. 使用你常用的 STM32 下载工具将 `hex` 或 `bin` 文件烧录到目标板。
-3. 上电后，固件会初始化 GPIO、USART2、TIM3、TIM4，并启动 PWM 输出。
+3. 上电后，固件会初始化 GPIO、USART2、TIM1/TIM2/TIM3/TIM4、I2C2。
+4. 初始化完成后会启动电机相关 PWM 与编码器，并初始化 PCA9685（地址 `0x40`，`50Hz`）。
 
 ## 中期验收视频
 项目根目录包含 `中期电控.zip`，内含 3 个演示视频：
@@ -54,18 +55,42 @@ W3B_NewPin 是华南理工大学歪比巴卜队的一个基于 STM32F103 的嵌�
 - build: 构建输出目录
 
 ## 使用示例
-### UART 摇杆数据包格式
-主程序解析形如 `[j,Lx,Ly,Rx,Ry]` 的数据包，范围为 -100 到 100：
+### UART 控制数据包格式（代码实装）
+主程序当前实现了以下 4 类控制帧：
+
+1. 摇杆控制帧（文本）
 ```
-[j,0,50,0,-50]
+[j,Lx,Ly,Rx,Ry]
 ```
-- `Ly` 映射到左电机速度（TIM3_CH1）
-- `Ry` 映射到右电机速度（TIM3_CH2）
-- 若 500 ms 内未接收到有效数据包，将自动将两路电机速度置零
+- `Lx/Ly/Rx/Ry` 取值范围为 `-100` 到 `100`
+- 其中 `Ly/Ry` 控制左右轮目标速度，`Lx` 控制原地旋转，`Rx` 控制麦克纳姆横移
+
+2. 舵机/速度控制帧（文本）
+```
+[s,id,x]
+```
+- `id=1/3/4/5`：控制对应舵机角度
+- `id=2`：设置键控前进/后退速度档位（百分比）
+
+3. 键控动作帧（文本）
+```
+[k,x,y]
+```
+- `x`：`w/s/j/l/q/a`
+- `y`：`d`(按下/开始) 或 `u`(松开/停止)
+
+4. 云台控制帧（二进制）
+```
+[0xAA, panL, panH, tiltL, tiltH, checksum, 0x55]
+```
+- `checksum` 为 `panL ^ panH ^ tiltL ^ tiltH`
+
+> 若超时 `500ms` 未接收到有效遥控输入，轮速目标自动回零（安全停机）。
 
 ### 关键引脚与外设
-- UART: USART2，PA2(TX) / PA3(RX)，波特率 9600
-- PWM: TIM3_CH1(PA6) 与 TIM3_CH2(PA7)
-- 电机控制 GPIO: PB13/14/15、PA8、PB3/4/5
-- 指示/激光输出: PA0
+- UART: USART2，PA2(TX) / PA3(RX)，波特率 115200
+- 电机 PWM: TIM3_CH1(PA6)、TIM3_CH2(PA7)、TIM1_CH1N(PB13)、TIM1_CH2N(PB14)
+- 编码器: TIM2_CH1/CH2(PA0/PA1)，TIM4_CH1/CH2(PB6/PB7)
+- 舵机总线: I2C2，PB10(SCL) / PB11(SDA)，PCA9685 地址 `0x40`
+- 电机方向控制 GPIO: PB15、PA8、PB5、PB4、PB3
 
