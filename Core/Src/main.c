@@ -71,7 +71,7 @@
 #define SERVO_TEST_ENABLE 0
 #define SERVO_TEST_ADDR_7BIT 0x40U
 #define SERVO_TEST_CHANNEL 0U
-#define SERVO_PACKET_ID3_CHANNEL 1U
+#define SERVO_PACKET_ID3_CHANNEL 14U
 #define SERVO_PACKET_ID4_CHANNEL 2U
 #define SERVO_PACKET_ID5_CHANNEL 3U
 #define SERVO_TEST_PWM_HZ 50U
@@ -88,7 +88,7 @@
 #define SERVO_TEST_STEP_DELAY_MS 500U
 
 /* [k,x,y] shared control packet:
- * x=q/a controls bucket dual-servo, x=j/l controls mecanum lateral move.
+ * x=q/a controls bucket dual-servo, x=w/s controls CH1.
  * y=d/u means press(start)/release(stop).
  */
 #define K_DUAL_SERVO_CHANNEL_A 4U
@@ -100,7 +100,13 @@
 #define K_DUAL_SERVO_SPEED_DEG_PER_SEC 300
 #define K_DUAL_SERVO_STEP_PERIOD_MS 20U
 
-/* Mecanum lateral move speed for [k,j/l,d/u]. */
+#define CH1_KEY_CTRL_CHANNEL 1U
+#define CH1_KEY_CTRL_MIN_ANGLE 0
+#define CH1_KEY_CTRL_MAX_ANGLE 150
+#define CH1_KEY_CTRL_SPEED_DEG_PER_SEC 30
+#define CH1_KEY_CTRL_STEP_PERIOD_MS 20U
+
+/* Mecanum lateral move speed (used by joystick strafe path). */
 #define K_MECANUM_LATERAL_SPEED_PCT 25
 
 /* USER CODE END PD */
@@ -337,17 +343,21 @@ static uint8_t joyFilterPos = 0;
 static uint8_t joyFilterCount = 0;
 static int16_t lastServoAngle = -1;
 static int16_t lastServoAngleCh1 = -1;
+static int16_t lastServoAngleCh14 = -1;
 static int16_t lastServoAngleCh2 = -1;
 static int16_t lastServoAngleCh3 = -1;
 static int16_t keyDriveSpeedPct = 100;
-/* -1: key backward(s), 0: idle, +1: key forward(w). */
-static int8_t keyDriveDir = 0;
 static WheelControl_t wheelControl = {0};
 static int32_t dualServoAngleA_mdeg = 0;
 static int16_t dualServoLastAppliedA = -1;
 static int8_t dualServoDir = 0;
 static uint8_t dualServoRunning = 0;
 static uint32_t dualServoLastTick = 0;
+static int32_t ch1KeyAngle_mdeg = 0;
+static int16_t ch1KeyLastApplied = -1;
+static int8_t ch1KeyDir = 0;
+static uint8_t ch1KeyRunning = 0;
+static uint32_t ch1KeyLastTick = 0;
 /* -1: left strafe, 0: stop/normal mode, +1: right strafe */
 static volatile int8_t mecanumLateralCmd = 0;
 // static uint32_t last_oled_update_tick = 0;
@@ -370,6 +380,7 @@ static HAL_StatusTypeDef ServoSetAngle180ByChannel(uint8_t channel, uint16_t ang
 static HAL_StatusTypeDef ServoSetAngle270ByChannel(uint8_t channel, uint16_t angleDeg);
 static HAL_StatusTypeDef DualServoApplyComplementAngleA(int16_t angleA);
 static void DualServoSyncStep(void);
+static void Ch1KeySyncStep(void);
 static void ApplyMecanumLateralCommand(int8_t lateralCmd, int16_t fallbackLeftPct, int16_t fallbackRightPct);
 #if SERVO_TEST_ENABLE
 static void RunServoCalibrationTest(void);
@@ -618,6 +629,54 @@ static void DualServoSyncStep(void)
   }
 }
 
+static void Ch1KeySyncStep(void)
+{
+  uint32_t nowTick;
+  uint32_t elapsedMs;
+  int32_t deltaMdeg;
+  int32_t nextMdeg;
+  int16_t nextAngle;
+
+  if (ch1KeyRunning == 0U || ch1KeyDir == 0)
+  {
+    return;
+  }
+
+  nowTick = HAL_GetTick();
+  elapsedMs = nowTick - ch1KeyLastTick;
+  if (elapsedMs < CH1_KEY_CTRL_STEP_PERIOD_MS)
+  {
+    return;
+  }
+  ch1KeyLastTick = nowTick;
+
+  deltaMdeg = (int32_t)ch1KeyDir * (int32_t)CH1_KEY_CTRL_SPEED_DEG_PER_SEC * (int32_t)elapsedMs;
+  nextMdeg = ch1KeyAngle_mdeg + deltaMdeg;
+
+  if (nextMdeg <= ((int32_t)CH1_KEY_CTRL_MIN_ANGLE * 1000))
+  {
+    nextMdeg = (int32_t)CH1_KEY_CTRL_MIN_ANGLE * 1000;
+    ch1KeyRunning = 0;
+    ch1KeyDir = 0;
+  }
+  else if (nextMdeg >= ((int32_t)CH1_KEY_CTRL_MAX_ANGLE * 1000))
+  {
+    nextMdeg = (int32_t)CH1_KEY_CTRL_MAX_ANGLE * 1000;
+    ch1KeyRunning = 0;
+    ch1KeyDir = 0;
+  }
+
+  ch1KeyAngle_mdeg = nextMdeg;
+  nextAngle = (int16_t)(ch1KeyAngle_mdeg / 1000);
+
+  if (nextAngle != ch1KeyLastApplied)
+  {
+    (void)ServoSetAngle180ByChannel(CH1_KEY_CTRL_CHANNEL, (uint16_t)nextAngle);
+    ch1KeyLastApplied = nextAngle;
+    lastServoAngleCh1 = nextAngle;
+  }
+}
+
 #if SERVO_TEST_ENABLE
 static void RunServoCalibrationTest(void)
 {
@@ -735,6 +794,13 @@ int main(void)
   dualServoRunning = 0;
   dualServoDir = 0;
   dualServoLastTick = HAL_GetTick();
+  (void)ServoSetAngle180ByChannel(CH1_KEY_CTRL_CHANNEL, 140U);
+  ch1KeyAngle_mdeg = 140000;
+  ch1KeyLastApplied = 140;
+  lastServoAngleCh1 = 140;
+  ch1KeyRunning = 0;
+  ch1KeyDir = 0;
+  ch1KeyLastTick = HAL_GetTick();
   mecanumLateralCmd = 0;
   HAL_UART_Receive_IT(&huart2, &rx_data, 1);
   
@@ -757,6 +823,7 @@ int main(void)
     int16_t cmdRPct = PwmCmdToPercent(cmdR, htim3.Init.Period);
     ApplyMecanumLateralCommand(mecanumLateralCmd, cmdLPct, cmdRPct);
     DualServoSyncStep();
+    Ch1KeySyncStep();
     SpeedA = cmdLPct;
     SpeedB = cmdRPct;
 
@@ -903,7 +970,7 @@ static void ProcessJoystickPacket(char *buf)
   */
 }
 
-/* Parse [s,id,x]: id=1 clamp servo(CH0), id=2 wheel constant speed, id=3 servo(CH1), id=4 servo(CH2), id=5 servo(CH3). */
+/* Parse [s,id,x]: id=1 clamp servo(CH0), id=2 wheel constant speed, id=3 servo(CH14), id=4 servo(CH2), id=5 servo(CH3). */
 static void ProcessServoPacket(char *buf)
 {
   int servoId;
@@ -929,17 +996,6 @@ static void ProcessServoPacket(char *buf)
     }
     speedPct = ClampSpeedPercent(speedPct);
     keyDriveSpeedPct = speedPct;
-
-    if (keyDriveDir > 0)
-    {
-      WheelControl_SetTargetsPercent(&wheelControl, keyDriveSpeedPct, keyDriveSpeedPct);
-      WheelControl_MarkValidRx(&wheelControl, HAL_GetTick());
-    }
-    else if (keyDriveDir < 0)
-    {
-      WheelControl_SetTargetsPercent(&wheelControl, (int16_t)(-keyDriveSpeedPct), (int16_t)(-keyDriveSpeedPct));
-      WheelControl_MarkValidRx(&wheelControl, HAL_GetTick());
-    }
     return;
   }
 
@@ -951,10 +1007,10 @@ static void ProcessServoPacket(char *buf)
       targetAngle = SERVO_TEST_LOGICAL_MAX_ANGLE;
     }
 
-    if (targetAngle != lastServoAngleCh1)
+    if (targetAngle != lastServoAngleCh14)
     {
       (void)ServoSetAngle180ByChannel(SERVO_PACKET_ID3_CHANNEL, (uint16_t)targetAngle);
-      lastServoAngleCh1 = targetAngle;
+      lastServoAngleCh14 = targetAngle;
     }
     return;
   }
@@ -1012,7 +1068,7 @@ static void ProcessServoPacket(char *buf)
 }
 
 /* Parse shared packet: format [k,x,y]
- * x: j/l for mecanum lateral; q/a for bucket dual-servo.
+ * x: w/s for CH1 key control; q/a for bucket dual-servo.
  * y: d/u, d = press/start, u = release/stop.
  */
 static void ProcessDualServoPacket(char *buf)
@@ -1030,20 +1086,10 @@ static void ProcessDualServoPacket(char *buf)
 
   if (stateCmd == 'u')
   {
-    if (moveCmd == 'j' || moveCmd == 'l')
-    {
-      mecanumLateralCmd = 0;
-      WheelControl_SetTargetsPercent(&wheelControl, 0, 0);
-      WheelControl_MarkValidRx(&wheelControl, HAL_GetTick());
-      return;
-    }
-
     if (moveCmd == 'w' || moveCmd == 's')
     {
-      keyDriveDir = 0;
-      mecanumLateralCmd = 0;
-      WheelControl_SetTargetsPercent(&wheelControl, 0, 0);
-      WheelControl_MarkValidRx(&wheelControl, HAL_GetTick());
+      ch1KeyRunning = 0;
+      ch1KeyDir = 0;
       return;
     }
 
@@ -1062,37 +1108,19 @@ static void ProcessDualServoPacket(char *buf)
     return;
   }
 
-  if (moveCmd == 'j')
-  {
-    mecanumLateralCmd = -1;
-    WheelControl_SetTargetsPercent(&wheelControl, 0, 0);
-    WheelControl_MarkValidRx(&wheelControl, HAL_GetTick());
-    return;
-  }
-
-  if (moveCmd == 'l')
-  {
-    mecanumLateralCmd = 1;
-    WheelControl_SetTargetsPercent(&wheelControl, 0, 0);
-    WheelControl_MarkValidRx(&wheelControl, HAL_GetTick());
-    return;
-  }
-
   if (moveCmd == 'w')
   {
-    keyDriveDir = 1;
-    mecanumLateralCmd = 0;
-    WheelControl_SetTargetsPercent(&wheelControl, keyDriveSpeedPct, keyDriveSpeedPct);
-    WheelControl_MarkValidRx(&wheelControl, HAL_GetTick());
+    ch1KeyDir = 1;
+    ch1KeyRunning = 1;
+    ch1KeyLastTick = HAL_GetTick();
     return;
   }
 
   if (moveCmd == 's')
   {
-    keyDriveDir = -1;
-    mecanumLateralCmd = 0;
-    WheelControl_SetTargetsPercent(&wheelControl, (int16_t)(-keyDriveSpeedPct), (int16_t)(-keyDriveSpeedPct));
-    WheelControl_MarkValidRx(&wheelControl, HAL_GetTick());
+    ch1KeyDir = -1;
+    ch1KeyRunning = 1;
+    ch1KeyLastTick = HAL_GetTick();
     return;
   }
 
