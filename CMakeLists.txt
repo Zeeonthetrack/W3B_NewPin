@@ -72,11 +72,24 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
     # Add user defined libraries
 )
 
+# Robust objcopy resolution: prefer the exact tool next to other resolved GNU Arm binaries.
+set(OBJCOPY_TOOL "${CMAKE_OBJCOPY}")
+if(CMAKE_NM)
+    get_filename_component(_ARM_BIN_DIR "${CMAKE_NM}" DIRECTORY)
+    set(_ARM_OBJCOPY_CANDIDATE "${_ARM_BIN_DIR}/arm-none-eabi-objcopy${CMAKE_EXECUTABLE_SUFFIX}")
+    set(_ARM_OBJCOPY_CANDIDATE_EXE "${_ARM_BIN_DIR}/arm-none-eabi-objcopy.exe")
+    if(EXISTS "${_ARM_OBJCOPY_CANDIDATE}")
+        set(OBJCOPY_TOOL "${_ARM_OBJCOPY_CANDIDATE}")
+    elseif(EXISTS "${_ARM_OBJCOPY_CANDIDATE_EXE}")
+        set(OBJCOPY_TOOL "${_ARM_OBJCOPY_CANDIDATE_EXE}")
+    endif()
+endif()
+
 add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
-    COMMAND ${CMAKE_OBJCOPY} -O ihex $<TARGET_FILE:${CMAKE_PROJECT_NAME}> $<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>/${CMAKE_PROJECT_NAME}.hex
+    COMMAND "${OBJCOPY_TOOL}" -O ihex $<TARGET_FILE:${CMAKE_PROJECT_NAME}> $<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>/${CMAKE_PROJECT_NAME}.hex
     COMMENT "Generated HEX file: ${CMAKE_PROJECT_NAME}.hex"
 )
 add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
-    COMMAND ${CMAKE_OBJCOPY} -O binary $<TARGET_FILE:${CMAKE_PROJECT_NAME}> $<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>/${CMAKE_PROJECT_NAME}.bin
+    COMMAND "${OBJCOPY_TOOL}" -O binary $<TARGET_FILE:${CMAKE_PROJECT_NAME}> $<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>/${CMAKE_PROJECT_NAME}.bin
     COMMENT "Generated BIN file: ${CMAKE_PROJECT_NAME}.bin"
 )

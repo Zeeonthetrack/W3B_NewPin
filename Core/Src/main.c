@@ -28,10 +28,7 @@
 /* USER CODE BEGIN Includes */
 #include <stdint.h>
 #include <string.h>
-#include <stdio.h>
 #include <stdlib.h>
-#include <ctype.h>
-#include <math.h>
 #include "pca9685.h"
 #include "wheel_control.h"
 /* #include "oled.h" */
@@ -50,72 +47,45 @@
 #define RIGHT_ENCODER_MAX_CPS 9400
 #define JOY_Y_ACTIVE_THRESHOLD_PCT 75
 #define JOY_X_ACTIVE_THRESHOLD_PCT 80
-#define JOY_RY_CH1_ACTIVE_THRESHOLD_PCT 70
 #define JOY_TIMEOUT_MS 500U
+#define UART_FRAME_BUF_SIZE 64U
 
-/* Binary motor packet: [0xAA, panL, panH, tiltL, tiltH, checksum, 0x55]. */
-#define MOTOR_PACKET_HEADER 0xAAU
-#define MOTOR_PACKET_FOOTER 0x55U
-#define MOTOR_PACKET_SIZE 7U
-#define PAN_TILT_FRAME_SIZE 4U
-#define PAN_SERVO_CHANNEL 8U
-#define TILT_SERVO_CHANNEL 9U
-#define PAN_MIN_ANGLE 0U
-#define PAN_MAX_ANGLE 180U
-#define TILT_MIN_ANGLE 0U
-#define TILT_MAX_ANGLE 180U
-#define SERVO_ABS_MAX_ANGLE 270U
+#define SERVO_ADDR_7BIT 0x40U
+#define SERVO_PWM_HZ 50U
 #define SERVO_MIN_PULSE_US 500U
 #define SERVO_MAX_PULSE_US 2500U
+#define SERVO_ANGLE_180_MAX 180U
+#define SERVO_ANGLE_270_MAX 270U
 
-/* Servo calibration test mode: set to 1 to run standalone servo test loop. */
-#define SERVO_TEST_ENABLE 0
-#define SERVO_TEST_ADDR_7BIT 0x40U
-#define SERVO_TEST_CHANNEL 0U
-#define SERVO_PACKET_ID3_CHANNEL 14U
-#define SERVO_PACKET_ID4_CHANNEL 2U
-#define SERVO_PACKET_ID5_CHANNEL 3U
-#define SERVO_TEST_PWM_HZ 50U
-/* Calibrate with a wide range first, then narrow if mechanical limit is reached. */
-#define SERVO_TEST_MIN_PULSE_US 500U
-#define SERVO_TEST_MAX_PULSE_US 2500U
-/* Logical angle is forced to 0~180 for standard positional servo. */
-#define SERVO_TEST_LOGICAL_MAX_ANGLE 180
-#define SERVO_TEST_MIN_ANGLE 0
-#define SERVO_TEST_MID_ANGLE 90
-#define SERVO_TEST_MAX_ANGLE 180
-#define SERVO_TEST_SWEEP_STEP 10
-#define SERVO_TEST_HOLD_MS 2000U
-#define SERVO_TEST_STEP_DELAY_MS 500U
+#define SERVO_SLIDER_GIMBAL_ID 1
+#define SERVO_SLIDER_SPEED_ID 2
+#define SERVO_SLIDER_UPPER_ID 3
+#define SERVO_SLIDER_MIDDLE_ID 4
+#define SERVO_SLIDER_LOWER_ID 5
 
-/* [k,x,y] shared control packet:
- * x=q/a controls bucket dual-servo, x=w/s controls CH1.
- * x=u/d controls CH3 clamp absolute angle: u=clamp(close 100deg), d=release(open 160deg).
- * x=x with y=u means key released, stop CH3 action.
- * y=d/u means press(start)/release(stop).
- */
-#define K_DUAL_SERVO_CHANNEL_A 4U
-#define K_DUAL_SERVO_CHANNEL_B 5U
-#define K_DUAL_SERVO_COMP_SUM_ANGLE 180
-#define K_DUAL_SERVO_CTRL_MIN_ANGLE 45
-#define K_DUAL_SERVO_CTRL_MAX_ANGLE 115
-#define K_DUAL_SERVO_INIT_ANGLE 30
-#define K_DUAL_SERVO_SPEED_DEG_PER_SEC 300
-#define K_DUAL_SERVO_STEP_PERIOD_MS 20U
+#define SERVO_CH_TRUNK 8U
+#define SERVO_CH_GIMBAL 9U
+#define SERVO_CH_LOWER 10U
+#define SERVO_CH_MIDDLE 11U
+#define SERVO_CH_UPPER 12U
+#define SERVO_CH_FLOWER 14U
+#define SERVO_CH_CLAMP 15U
 
-#define CH1_KEY_CTRL_CHANNEL 1U
-#define CH1_KEY_CTRL_MIN_ANGLE 0
-#define CH1_KEY_CTRL_MAX_ANGLE 150
-#define CH1_KEY_CTRL_SPEED_DEG_PER_SEC 30
-#define CH1_KEY_CTRL_STEP_PERIOD_MS 20U
+#define FLOWER_MIN_ANGLE 0
+#define FLOWER_MAX_ANGLE 90
+#define FLOWER_INIT_ANGLE 45
+#define FLOWER_SPEED_DEG_PER_SEC 20
+#define FLOWER_STEP_PERIOD_MS 20U
 
-#define CH3_KEY_CTRL_CHANNEL SERVO_PACKET_ID5_CHANNEL
-#define CH3_KEY_CTRL_MIN_ANGLE 0
-#define CH3_KEY_CTRL_MAX_ANGLE 180
-#define CH3_KEY_CTRL_CLAMP_ANGLE 100
-#define CH3_KEY_CTRL_RELEASE_ANGLE 160
-#define CH3_KEY_CTRL_SPEED_DEG_PER_SEC 100
-#define CH3_KEY_CTRL_STEP_PERIOD_MS 20U
+#define CLAMP_CLOSE_ANGLE 100
+#define CLAMP_OPEN_ANGLE 33
+#define TRUNK_RETRACT_ANGLE 33
+#define TRUNK_OPEN_ANGLE 120
+
+#define GIMBAL_INIT_ANGLE 135U
+#define UPPER_INIT_ANGLE 90U
+#define MIDDLE_INIT_ANGLE 90U
+#define LOWER_INIT_ANGLE 90U
 
 /* Mecanum lateral speed ratio: strafe = forward/backward * 3/4. */
 #define K_MECANUM_LATERAL_SCALE_NUM 3
@@ -335,47 +305,33 @@ uint8_t rx_data = 0;
 int16_t SpeedA = 0;
 int16_t SpeedB = 0;
 /* UART packet buffer for assembling incoming bytes */
-static char uart_rx_buf[64];
+static char uart_rx_buf[UART_FRAME_BUF_SIZE];
 static uint8_t uart_rx_idx = 0;
 static uint8_t uart_in_frame = 0;
-static uint8_t motor_pkt_buf[MOTOR_PACKET_SIZE];
-static uint8_t motor_pkt_idx = 0;
-static uint8_t motor_pkt_in_frame = 0;
 /* mailbox: always keep only latest completed frame */
-static volatile char uart_latest_frame[64];
+static volatile char uart_latest_frame[UART_FRAME_BUF_SIZE];
 static volatile uint8_t uart_latest_ready = 0;
-static volatile uint8_t motor_latest_payload[PAN_TILT_FRAME_SIZE];
-static volatile uint8_t motor_latest_ready = 0;
+static volatile uint8_t uart_latest_len = 0;
 /* joystick filters/state */
 #define JOY_FILTER_SIZE 1
 static int16_t joyLxBuf[JOY_FILTER_SIZE];
 static int16_t joyLyBuf[JOY_FILTER_SIZE];
 static int16_t joyRxBuf[JOY_FILTER_SIZE];
-static int16_t joyRyBuf[JOY_FILTER_SIZE];
 static uint8_t joyFilterPos = 0;
 static uint8_t joyFilterCount = 0;
-static int16_t lastServoAngle = -1;
-static int16_t lastServoAngleCh1 = -1;
-static int16_t lastServoAngleCh14 = -1;
-static int16_t lastServoAngleCh2 = -1;
-static int16_t lastServoAngleCh3 = -1;
 static int16_t keyDriveSpeedPct = 50;
 static WheelControl_t wheelControl = {0};
-static int32_t dualServoAngleA_mdeg = 0;
-static int16_t dualServoLastAppliedA = -1;
-static int8_t dualServoDir = 0;
-static uint8_t dualServoRunning = 0;
-static uint32_t dualServoLastTick = 0;
-static int32_t ch1KeyAngle_mdeg = 0;
-static int16_t ch1KeyLastApplied = -1;
-static int8_t ch1KeyDir = 0;
-static uint8_t ch1KeyRunning = 0;
-static uint32_t ch1KeyLastTick = 0;
-static int32_t ch3KeyAngle_mdeg = 0;
-static int16_t ch3KeyLastApplied = -1;
-static int8_t ch3KeyDir = 0;
-static uint8_t ch3KeyRunning = 0;
-static uint32_t ch3KeyLastTick = 0;
+static int16_t gimbalLastApplied = -1;
+static int16_t upperLastApplied = -1;
+static int16_t middleLastApplied = -1;
+static int16_t lowerLastApplied = -1;
+static int16_t clampLastApplied = -1;
+static int16_t trunkLastApplied = -1;
+static int32_t flowerAngle_mdeg = 0;
+static int16_t flowerLastApplied = -1;
+static int8_t flowerDir = 0;
+static uint8_t flowerRunning = 0;
+static uint32_t flowerLastTick = 0;
 /* -1: left strafe, 0: stop/normal mode, +1: right strafe */
 static volatile int8_t mecanumLateralCmd = 0;
 /* Direct-drive bypass for modes that should not pass through S-curve. */
@@ -394,64 +350,87 @@ static void ProcessServoPacket(char *buf);
 static void ProcessDualServoPacket(char *buf);
 static void ProcessUartBytes(void);
 static void ProcessLatestUartFrame(void);
-static void ProcessLatestPanTiltPayload(void);
-static uint8_t CalculateChecksumXor(const uint8_t *data, uint8_t len);
-static void ProcessPanTiltFrame(const uint8_t frame[PAN_TILT_FRAME_SIZE]);
-static HAL_StatusTypeDef ServoSetAngle180(uint16_t angleDeg);
+static uint8_t ParseSignedInt16Fast(const char **cursor, int16_t *outValue);
+static char AsciiToLowerFast(char ch);
+static void StartUartReceive(void);
 static HAL_StatusTypeDef ServoSetAngle180ByChannel(uint8_t channel, uint16_t angleDeg);
 static HAL_StatusTypeDef ServoSetAngle270ByChannel(uint8_t channel, uint16_t angleDeg);
-static HAL_StatusTypeDef DualServoApplyComplementAngleA(int16_t angleA);
-static void DualServoSyncStep(void);
-static void Ch1KeySyncStep(void);
-static void Ch3KeyApplyAbsoluteAngle(int16_t targetAngle);
-static void Ch3KeySyncStep(void);
+static HAL_StatusTypeDef ServoSetPulseUsByChannel(uint8_t channel, uint16_t pulseUs);
+static void FlowerHandSyncStep(void);
 static void ApplyMecanumLateralCommand(int8_t lateralCmd, int16_t fallbackLeftPct, int16_t fallbackRightPct);
-#if SERVO_TEST_ENABLE
-static void RunServoCalibrationTest(void);
-#endif
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-static uint8_t CalculateChecksumXor(const uint8_t *data, uint8_t len)
+static char AsciiToLowerFast(char ch)
 {
-  uint8_t sum = 0U;
-  uint8_t i;
+  if (ch >= 'A' && ch <= 'Z')
+  {
+    return (char)(ch + ('a' - 'A'));
+  }
+  return ch;
+}
 
-  if (data == NULL)
+static uint8_t ParseSignedInt16Fast(const char **cursor, int16_t *outValue)
+{
+  const char *p;
+  int32_t sign = 1;
+  int32_t value = 0;
+  uint8_t hasDigit = 0U;
+
+  if (cursor == NULL || *cursor == NULL || outValue == NULL)
   {
     return 0U;
   }
 
-  for (i = 0U; i < len; i++)
+  p = *cursor;
+
+  if (*p == '+')
   {
-    sum ^= data[i];
+    p++;
   }
-  return sum;
+  else if (*p == '-')
+  {
+    sign = -1;
+    p++;
+  }
+
+  while (*p >= '0' && *p <= '9')
+  {
+    hasDigit = 1U;
+    value = (value * 10) + (int32_t)(*p - '0');
+    if (value > 32768)
+    {
+      return 0U;
+    }
+    p++;
+  }
+
+  if (hasDigit == 0U)
+  {
+    return 0U;
+  }
+
+  value *= sign;
+  if (value < -32768 || value > 32767)
+  {
+    return 0U;
+  }
+
+  *outValue = (int16_t)value;
+  *cursor = p;
+  return 1U;
+}
+
+static void StartUartReceive(void)
+{
+  (void)HAL_UART_Receive_IT(&huart2, &rx_data, 1);
 }
 
 static void ProcessUartBytes(void)
 {
   ProcessLatestUartFrame();
-  ProcessLatestPanTiltPayload();
-}
-
-static void ProcessLatestPanTiltPayload(void)
-{
-  uint8_t payload[PAN_TILT_FRAME_SIZE];
-
-  if (!motor_latest_ready)
-  {
-    return;
-  }
-
-  __disable_irq();
-  memcpy(payload, (const void *)motor_latest_payload, PAN_TILT_FRAME_SIZE);
-  motor_latest_ready = 0;
-  __enable_irq();
-
-  ProcessPanTiltFrame(payload);
 }
 
 static void ApplyMecanumLateralCommand(int8_t lateralCmd, int16_t fallbackLeftPct, int16_t fallbackRightPct)
@@ -485,178 +464,90 @@ static void ApplyMecanumLateralCommand(int8_t lateralCmd, int16_t fallbackLeftPc
 
 static void ProcessLatestUartFrame(void)
 {
-  char frame[64];
+  char frame[UART_FRAME_BUF_SIZE];
+  uint8_t frameLen;
+
   if (!uart_latest_ready)
   {
     return;
   }
 
   __disable_irq();
-  strncpy(frame, (const char *)uart_latest_frame, sizeof(frame) - 1);
-  frame[sizeof(frame) - 1] = '\0';
+  frameLen = uart_latest_len;
+  if (frameLen >= (uint8_t)sizeof(frame))
+  {
+    frameLen = (uint8_t)(sizeof(frame) - 1U);
+  }
+  memcpy(frame, (const void *)uart_latest_frame, frameLen);
+  frame[frameLen] = '\0';
   uart_latest_ready = 0;
   __enable_irq();
 
-  if (frame[0] == '[' && frame[1] != '\0')
+  if (frameLen < 4U || frame[0] != '[' || frame[1] == '\0')
   {
-    if (frame[1] == 'j')
-    {
-      ProcessJoystickPacket(frame);
-    }
-    else if (frame[1] == 's')
-    {
-      ProcessServoPacket(frame);
-    }
-    else if (frame[1] == 'k')
-    {
-      ProcessDualServoPacket(frame);
-    }
+    return;
+  }
+
+  if (AsciiToLowerFast(frame[1]) == 'j')
+  {
+    ProcessJoystickPacket(frame);
+  }
+  else if (AsciiToLowerFast(frame[1]) == 's')
+  {
+    ProcessServoPacket(frame);
+  }
+  else if (AsciiToLowerFast(frame[1]) == 'k')
+  {
+    ProcessDualServoPacket(frame);
   }
 }
 
-static HAL_StatusTypeDef ServoSetAngle180(uint16_t angleDeg)
+static HAL_StatusTypeDef ServoSetPulseUsByChannel(uint8_t channel, uint16_t pulseUs)
 {
-  return ServoSetAngle180ByChannel(SERVO_TEST_CHANNEL, angleDeg);
+  if (pulseUs < SERVO_MIN_PULSE_US)
+  {
+    pulseUs = SERVO_MIN_PULSE_US;
+  }
+  else if (pulseUs > SERVO_MAX_PULSE_US)
+  {
+    pulseUs = SERVO_MAX_PULSE_US;
+  }
+
+  return PCA9685_SetServoPulseUs(&hi2c2, SERVO_ADDR_7BIT, channel, pulseUs, SERVO_PWM_HZ);
 }
 
 static HAL_StatusTypeDef ServoSetAngle180ByChannel(uint8_t channel, uint16_t angleDeg)
 {
   uint32_t pulseUs;
 
-  if (angleDeg > SERVO_TEST_LOGICAL_MAX_ANGLE)
+  if (angleDeg > SERVO_ANGLE_180_MAX)
   {
-    angleDeg = SERVO_TEST_LOGICAL_MAX_ANGLE;
+    angleDeg = SERVO_ANGLE_180_MAX;
   }
 
-  pulseUs = SERVO_TEST_MIN_PULSE_US +
-            (((uint32_t)(SERVO_TEST_MAX_PULSE_US - SERVO_TEST_MIN_PULSE_US) * angleDeg) /
-             SERVO_TEST_LOGICAL_MAX_ANGLE);
+  pulseUs = SERVO_MIN_PULSE_US +
+            (((uint32_t)(SERVO_MAX_PULSE_US - SERVO_MIN_PULSE_US) * angleDeg) / SERVO_ANGLE_180_MAX);
 
-  return PCA9685_SetServoPulseUs(&hi2c2,
-                                 SERVO_TEST_ADDR_7BIT,
-                                 channel,
-                                 (uint16_t)pulseUs,
-                                 SERVO_TEST_PWM_HZ);
+  return ServoSetPulseUsByChannel(channel, (uint16_t)pulseUs);
 }
 
 static HAL_StatusTypeDef ServoSetAngle270ByChannel(uint8_t channel, uint16_t angleDeg)
 {
   uint32_t pulseUs;
 
-  if (angleDeg > SERVO_ABS_MAX_ANGLE)
+  if (angleDeg > SERVO_ANGLE_270_MAX)
   {
-    angleDeg = SERVO_ABS_MAX_ANGLE;
+    angleDeg = SERVO_ANGLE_270_MAX;
   }
 
   pulseUs = SERVO_MIN_PULSE_US +
             (((uint32_t)(SERVO_MAX_PULSE_US - SERVO_MIN_PULSE_US) * angleDeg) /
-             SERVO_ABS_MAX_ANGLE);
+             SERVO_ANGLE_270_MAX);
 
-  return PCA9685_SetServoPulseUs(&hi2c2,
-                                 SERVO_TEST_ADDR_7BIT,
-                                 channel,
-                                 (uint16_t)pulseUs,
-                                 SERVO_TEST_PWM_HZ);
+  return ServoSetPulseUsByChannel(channel, (uint16_t)pulseUs);
 }
 
-static void ProcessPanTiltFrame(const uint8_t frame[PAN_TILT_FRAME_SIZE])
-{
-  uint16_t pan = (uint16_t)frame[0] | ((uint16_t)frame[1] << 8);
-  uint16_t tilt = (uint16_t)frame[2] | ((uint16_t)frame[3] << 8);
-
-  if (pan > PAN_MAX_ANGLE)
-  {
-    pan = PAN_MAX_ANGLE;
-  }
-
-  if (tilt < TILT_MIN_ANGLE)
-  {
-    tilt = TILT_MIN_ANGLE;
-  }
-  if (tilt > TILT_MAX_ANGLE)
-  {
-    tilt = TILT_MAX_ANGLE;
-  }
-
-  (void)ServoSetAngle270ByChannel(PAN_SERVO_CHANNEL, pan);
-  (void)ServoSetAngle270ByChannel(TILT_SERVO_CHANNEL, tilt);
-}
-
-static HAL_StatusTypeDef DualServoApplyComplementAngleA(int16_t angleA)
-{
-  HAL_StatusTypeDef stA;
-  HAL_StatusTypeDef stB;
-  int16_t angleB;
-
-  if (angleA < K_DUAL_SERVO_CTRL_MIN_ANGLE)
-  {
-    angleA = K_DUAL_SERVO_CTRL_MIN_ANGLE;
-  }
-  if (angleA > K_DUAL_SERVO_CTRL_MAX_ANGLE)
-  {
-    angleA = K_DUAL_SERVO_CTRL_MAX_ANGLE;
-  }
-
-  angleB = (int16_t)(K_DUAL_SERVO_COMP_SUM_ANGLE - angleA);
-
-  stA = ServoSetAngle180ByChannel(K_DUAL_SERVO_CHANNEL_A, (uint16_t)angleA);
-  stB = ServoSetAngle180ByChannel(K_DUAL_SERVO_CHANNEL_B, (uint16_t)angleB);
-
-  if (stA != HAL_OK)
-  {
-    return stA;
-  }
-  return stB;
-}
-
-static void DualServoSyncStep(void)
-{
-  uint32_t nowTick;
-  uint32_t elapsedMs;
-  int32_t deltaMdeg;
-  int32_t nextMdeg;
-  int16_t nextAngleA;
-
-  if (dualServoRunning == 0U || dualServoDir == 0)
-  {
-    return;
-  }
-
-  nowTick = HAL_GetTick();
-  elapsedMs = nowTick - dualServoLastTick;
-  if (elapsedMs < K_DUAL_SERVO_STEP_PERIOD_MS)
-  {
-    return;
-  }
-  dualServoLastTick = nowTick;
-
-  deltaMdeg = (int32_t)dualServoDir * (int32_t)K_DUAL_SERVO_SPEED_DEG_PER_SEC * (int32_t)elapsedMs;
-  nextMdeg = dualServoAngleA_mdeg + deltaMdeg;
-
-  if (nextMdeg <= ((int32_t)K_DUAL_SERVO_CTRL_MIN_ANGLE * 1000))
-  {
-    nextMdeg = (int32_t)K_DUAL_SERVO_CTRL_MIN_ANGLE * 1000;
-    dualServoRunning = 0;
-    dualServoDir = 0;
-  }
-  else if (nextMdeg >= ((int32_t)K_DUAL_SERVO_CTRL_MAX_ANGLE * 1000))
-  {
-    nextMdeg = (int32_t)K_DUAL_SERVO_CTRL_MAX_ANGLE * 1000;
-    dualServoRunning = 0;
-    dualServoDir = 0;
-  }
-
-  dualServoAngleA_mdeg = nextMdeg;
-  nextAngleA = (int16_t)(dualServoAngleA_mdeg / 1000);
-
-  if (nextAngleA != dualServoLastAppliedA)
-  {
-    (void)DualServoApplyComplementAngleA(nextAngleA);
-    dualServoLastAppliedA = nextAngleA;
-  }
-}
-
-static void Ch1KeySyncStep(void)
+static void FlowerHandSyncStep(void)
 {
   uint32_t nowTick;
   uint32_t elapsedMs;
@@ -664,143 +555,44 @@ static void Ch1KeySyncStep(void)
   int32_t nextMdeg;
   int16_t nextAngle;
 
-  if (ch1KeyRunning == 0U || ch1KeyDir == 0)
+  if (flowerRunning == 0U || flowerDir == 0)
   {
     return;
   }
 
   nowTick = HAL_GetTick();
-  elapsedMs = nowTick - ch1KeyLastTick;
-  if (elapsedMs < CH1_KEY_CTRL_STEP_PERIOD_MS)
+  elapsedMs = nowTick - flowerLastTick;
+  if (elapsedMs < FLOWER_STEP_PERIOD_MS)
   {
     return;
   }
-  ch1KeyLastTick = nowTick;
+  flowerLastTick = nowTick;
 
-  deltaMdeg = (int32_t)ch1KeyDir * (int32_t)CH1_KEY_CTRL_SPEED_DEG_PER_SEC * (int32_t)elapsedMs;
-  nextMdeg = ch1KeyAngle_mdeg + deltaMdeg;
+  deltaMdeg = (int32_t)flowerDir * (int32_t)FLOWER_SPEED_DEG_PER_SEC * (int32_t)elapsedMs;
+  nextMdeg = flowerAngle_mdeg + deltaMdeg;
 
-  if (nextMdeg <= ((int32_t)CH1_KEY_CTRL_MIN_ANGLE * 1000))
+  if (nextMdeg <= ((int32_t)FLOWER_MIN_ANGLE * 1000))
   {
-    nextMdeg = (int32_t)CH1_KEY_CTRL_MIN_ANGLE * 1000;
-    ch1KeyRunning = 0;
-    ch1KeyDir = 0;
+    nextMdeg = (int32_t)FLOWER_MIN_ANGLE * 1000;
+    flowerRunning = 0;
+    flowerDir = 0;
   }
-  else if (nextMdeg >= ((int32_t)CH1_KEY_CTRL_MAX_ANGLE * 1000))
+  else if (nextMdeg >= ((int32_t)FLOWER_MAX_ANGLE * 1000))
   {
-    nextMdeg = (int32_t)CH1_KEY_CTRL_MAX_ANGLE * 1000;
-    ch1KeyRunning = 0;
-    ch1KeyDir = 0;
-  }
-
-  ch1KeyAngle_mdeg = nextMdeg;
-  nextAngle = (int16_t)(ch1KeyAngle_mdeg / 1000);
-
-  if (nextAngle != ch1KeyLastApplied)
-  {
-    (void)ServoSetAngle180ByChannel(CH1_KEY_CTRL_CHANNEL, (uint16_t)nextAngle);
-    ch1KeyLastApplied = nextAngle;
-    lastServoAngleCh1 = nextAngle;
-  }
-}
-
-static void Ch3KeyApplyAbsoluteAngle(int16_t targetAngle)
-{
-  if (targetAngle < CH3_KEY_CTRL_MIN_ANGLE)
-  {
-    targetAngle = CH3_KEY_CTRL_MIN_ANGLE;
-  }
-  else if (targetAngle > CH3_KEY_CTRL_MAX_ANGLE)
-  {
-    targetAngle = CH3_KEY_CTRL_MAX_ANGLE;
+    nextMdeg = (int32_t)FLOWER_MAX_ANGLE * 1000;
+    flowerRunning = 0;
+    flowerDir = 0;
   }
 
-  ch3KeyAngle_mdeg = (int32_t)targetAngle * 1000;
-  ch3KeyLastApplied = targetAngle;
-  lastServoAngleCh3 = targetAngle;
-  ch3KeyRunning = 0;
-  ch3KeyDir = 0;
-  ch3KeyLastTick = HAL_GetTick();
-  (void)ServoSetAngle180ByChannel(CH3_KEY_CTRL_CHANNEL, (uint16_t)targetAngle);
-}
+  flowerAngle_mdeg = nextMdeg;
+  nextAngle = (int16_t)(flowerAngle_mdeg / 1000);
 
-static void Ch3KeySyncStep(void)
-{
-  uint32_t nowTick;
-  uint32_t elapsedMs;
-  int32_t deltaMdeg;
-  int32_t nextMdeg;
-  int16_t nextAngle;
-
-  if (ch3KeyRunning == 0U || ch3KeyDir == 0)
+  if (nextAngle != flowerLastApplied)
   {
-    return;
-  }
-
-  nowTick = HAL_GetTick();
-  elapsedMs = nowTick - ch3KeyLastTick;
-  if (elapsedMs < CH3_KEY_CTRL_STEP_PERIOD_MS)
-  {
-    return;
-  }
-  ch3KeyLastTick = nowTick;
-
-  deltaMdeg = (int32_t)ch3KeyDir * (int32_t)CH3_KEY_CTRL_SPEED_DEG_PER_SEC * (int32_t)elapsedMs;
-  nextMdeg = ch3KeyAngle_mdeg + deltaMdeg;
-
-  if (nextMdeg <= ((int32_t)CH3_KEY_CTRL_MIN_ANGLE * 1000))
-  {
-    nextMdeg = (int32_t)CH3_KEY_CTRL_MIN_ANGLE * 1000;
-    ch3KeyRunning = 0;
-    ch3KeyDir = 0;
-  }
-  else if (nextMdeg >= ((int32_t)CH3_KEY_CTRL_MAX_ANGLE * 1000))
-  {
-    nextMdeg = (int32_t)CH3_KEY_CTRL_MAX_ANGLE * 1000;
-    ch3KeyRunning = 0;
-    ch3KeyDir = 0;
-  }
-
-  ch3KeyAngle_mdeg = nextMdeg;
-  nextAngle = (int16_t)(ch3KeyAngle_mdeg / 1000);
-
-  if (nextAngle != ch3KeyLastApplied)
-  {
-    (void)ServoSetAngle180ByChannel(CH3_KEY_CTRL_CHANNEL, (uint16_t)nextAngle);
-    ch3KeyLastApplied = nextAngle;
-    lastServoAngleCh3 = nextAngle;
+    (void)ServoSetAngle180ByChannel(SERVO_CH_FLOWER, (uint16_t)nextAngle);
+    flowerLastApplied = nextAngle;
   }
 }
-
-#if SERVO_TEST_ENABLE
-static void RunServoCalibrationTest(void)
-{
-  int16_t angle;
-
-  /* Step 1: hold min/mid/max to quickly observe center and endpoints. */
-  (void)ServoSetAngle180(SERVO_TEST_MIN_ANGLE);
-  HAL_Delay(SERVO_TEST_HOLD_MS);
-
-  (void)ServoSetAngle180(SERVO_TEST_MID_ANGLE);
-  HAL_Delay(SERVO_TEST_HOLD_MS);
-
-  (void)ServoSetAngle180(SERVO_TEST_MAX_ANGLE);
-  HAL_Delay(SERVO_TEST_HOLD_MS);
-
-  /* Step 2: sweep up/down so you can find the practical limits. */
-  for (angle = SERVO_TEST_MIN_ANGLE; angle <= SERVO_TEST_MAX_ANGLE; angle += SERVO_TEST_SWEEP_STEP)
-  {
-    (void)ServoSetAngle180((uint16_t)angle);
-    HAL_Delay(SERVO_TEST_STEP_DELAY_MS);
-  }
-
-  for (angle = SERVO_TEST_MAX_ANGLE; angle >= SERVO_TEST_MIN_ANGLE; angle -= SERVO_TEST_SWEEP_STEP)
-  {
-    (void)ServoSetAngle180((uint16_t)angle);
-    HAL_Delay(SERVO_TEST_STEP_DELAY_MS);
-  }
-}
-#endif
 
 /* USER CODE END 0 */
 
@@ -870,35 +662,36 @@ int main(void)
     JOY_TIMEOUT_MS,
     HAL_GetTick());
   
-  HAL_StatusTypeDef pca_status = PCA9685_Init(&hi2c2, 0x40, 50);
+  HAL_StatusTypeDef pca_status = PCA9685_Init(&hi2c2, SERVO_ADDR_7BIT, SERVO_PWM_HZ);
   (void)pca_status;
-
-#if SERVO_TEST_ENABLE
-  while (1)
-  {
-    RunServoCalibrationTest();
-  }
-#endif
 
   SetSpeed_L(0);
   SetSpeed_R(0);
   SetSpeed_H(0);
-  (void)DualServoApplyComplementAngleA(K_DUAL_SERVO_INIT_ANGLE);
-  dualServoAngleA_mdeg = (int32_t)K_DUAL_SERVO_INIT_ANGLE * 1000;
-  dualServoLastAppliedA = K_DUAL_SERVO_INIT_ANGLE;
-  dualServoRunning = 0;
-  dualServoDir = 0;
-  dualServoLastTick = HAL_GetTick();
-  (void)ServoSetAngle180ByChannel(CH1_KEY_CTRL_CHANNEL, 140U);
-  ch1KeyAngle_mdeg = 140000;
-  ch1KeyLastApplied = 140;
-  lastServoAngleCh1 = 140;
-  ch1KeyRunning = 0;
-  ch1KeyDir = 0;
-  ch1KeyLastTick = HAL_GetTick();
-  Ch3KeyApplyAbsoluteAngle(CH3_KEY_CTRL_RELEASE_ANGLE);
+
+  (void)ServoSetAngle270ByChannel(SERVO_CH_GIMBAL, GIMBAL_INIT_ANGLE);
+  gimbalLastApplied = (int16_t)GIMBAL_INIT_ANGLE;
+  (void)ServoSetAngle180ByChannel(SERVO_CH_UPPER, UPPER_INIT_ANGLE);
+  upperLastApplied = (int16_t)UPPER_INIT_ANGLE;
+  (void)ServoSetAngle180ByChannel(SERVO_CH_MIDDLE, MIDDLE_INIT_ANGLE);
+  middleLastApplied = (int16_t)MIDDLE_INIT_ANGLE;
+  (void)ServoSetAngle180ByChannel(SERVO_CH_LOWER, LOWER_INIT_ANGLE);
+  lowerLastApplied = (int16_t)LOWER_INIT_ANGLE;
+
+  flowerAngle_mdeg = (int32_t)FLOWER_INIT_ANGLE * 1000;
+  flowerLastApplied = FLOWER_INIT_ANGLE;
+  flowerDir = 0;
+  flowerRunning = 0;
+  flowerLastTick = HAL_GetTick();
+  (void)ServoSetAngle180ByChannel(SERVO_CH_FLOWER, (uint16_t)FLOWER_INIT_ANGLE);
+
+  (void)ServoSetAngle180ByChannel(SERVO_CH_CLAMP, (uint16_t)CLAMP_OPEN_ANGLE);
+  clampLastApplied = CLAMP_OPEN_ANGLE;
+  (void)ServoSetAngle180ByChannel(SERVO_CH_TRUNK, (uint16_t)TRUNK_RETRACT_ANGLE);
+  trunkLastApplied = TRUNK_RETRACT_ANGLE;
+
   mecanumLateralCmd = 0;
-  HAL_UART_Receive_IT(&huart2, &rx_data, 1);
+  StartUartReceive();
   
 
   /* USER CODE END 2 */
@@ -938,13 +731,11 @@ int main(void)
     }
 
     ApplyMecanumLateralCommand(mecanumLateralCmd, applyLeftPct, applyRightPct);
-    DualServoSyncStep();
-    Ch1KeySyncStep();
-    Ch3KeySyncStep();
+    FlowerHandSyncStep();
     SpeedA = applyLeftPct;
     SpeedB = applyRightPct;
 
-    HAL_Delay(1);
+    __WFI();
   }
   /* USER CODE END 3 */
 }
@@ -993,21 +784,27 @@ void SystemClock_Config(void)
  * Ly: forward/backward constant speed trigger by threshold.
  * Lx: rotate (left=CCW, right=CW) by threshold.
  * Rx: mecanum strafe (left/right) by threshold.
- * Ry: CH1 up/down run command (up=decrease angle, down=increase angle).
+ * Ry: reserved for future use.
  */
 static void ProcessJoystickPacket(char *buf)
 {
-  int Lx, Ly, Rx, Ry;
-  if (buf[0] != '[' || buf[1] != 'j' || buf[2] != ',') return;
-  char *end = strchr(buf, ']');
-  if (!end) return;
-  /* parse only the substring from start to end */
-  char tmpBuf[48];
-  size_t len = (size_t)(end - (buf + 3)); /* after header */
-  if (len >= sizeof(tmpBuf)) return;
-  memcpy(tmpBuf, buf + 3, len);
-  tmpBuf[len] = '\0';
-  if (sscanf(tmpBuf, "%d,%d,%d,%d", &Lx, &Ly, &Rx, &Ry) != 4) return;
+  const char *p = buf;
+  int16_t Lx;
+  int16_t Ly;
+  int16_t Rx;
+  int16_t Ry;
+
+  if (p[0] != '[' || AsciiToLowerFast(p[1]) != 'j' || p[2] != ',') return;
+
+  p += 3;
+  if (ParseSignedInt16Fast(&p, &Lx) == 0U || *p != ',') return;
+  p++;
+  if (ParseSignedInt16Fast(&p, &Ly) == 0U || *p != ',') return;
+  p++;
+  if (ParseSignedInt16Fast(&p, &Rx) == 0U || *p != ',') return;
+  p++;
+  if (ParseSignedInt16Fast(&p, &Ry) == 0U || *p != ']' || p[1] != '\0') return;
+
   /* validate ranges */
   if (Lx < -100 || Lx > 100 || Ly < -100 || Ly > 100 || Rx < -100 || Rx > 100 || Ry < -100 || Ry > 100) return;
 
@@ -1018,22 +815,21 @@ static void ProcessJoystickPacket(char *buf)
   joyLxBuf[joyFilterPos] = (int16_t)Lx;
   joyLyBuf[joyFilterPos] = (int16_t)Ly;
   joyRxBuf[joyFilterPos] = (int16_t)Rx;
-  joyRyBuf[joyFilterPos] = (int16_t)Ry;
   joyFilterPos = (joyFilterPos + 1) % JOY_FILTER_SIZE;
   if (joyFilterCount < JOY_FILTER_SIZE) joyFilterCount++;
 
-  int sumLx = 0, sumLy = 0, sumRx = 0, sumRy = 0;
+  int sumLx = 0;
+  int sumLy = 0;
+  int sumRx = 0;
   for (uint8_t i = 0; i < joyFilterCount; i++)
   {
     sumLx += joyLxBuf[i];
     sumLy += joyLyBuf[i];
     sumRx += joyRxBuf[i];
-    sumRy += joyRyBuf[i];
   }
   int16_t avgLx = (int16_t)(sumLx / (int)joyFilterCount);
   int16_t avgLy = (int16_t)(sumLy / (int)joyFilterCount);
   int16_t avgRx = (int16_t)(sumRx / (int)joyFilterCount);
-  int16_t avgRy = (int16_t)(sumRy / (int)joyFilterCount);
 
   int16_t leftTargetPct = 0;
   int16_t rightTargetPct = 0;
@@ -1072,31 +868,6 @@ static void ProcessJoystickPacket(char *buf)
   else
   {
     mecanumLateralCmd = 0;
-  }
-
-  /* Reverse CH1 mapping: up decreases angle, down increases angle. */
-  if (avgRy >= JOY_RY_CH1_ACTIVE_THRESHOLD_PCT)
-  {
-    if (ch1KeyDir != -1 || ch1KeyRunning == 0U)
-    {
-      ch1KeyDir = -1;
-      ch1KeyRunning = 1;
-      ch1KeyLastTick = HAL_GetTick();
-    }
-  }
-  else if (avgRy <= -JOY_RY_CH1_ACTIVE_THRESHOLD_PCT)
-  {
-    if (ch1KeyDir != 1 || ch1KeyRunning == 0U)
-    {
-      ch1KeyDir = 1;
-      ch1KeyRunning = 1;
-      ch1KeyLastTick = HAL_GetTick();
-    }
-  }
-  else
-  {
-    ch1KeyDir = 0;
-    ch1KeyRunning = 0;
   }
 
   if (mecanumLateralCmd != 0)
@@ -1141,138 +912,117 @@ static void ProcessJoystickPacket(char *buf)
   */
 }
 
-/* Parse [s,id,x]: id=1 clamp servo(CH0), id=2 wheel constant speed, id=3 servo(CH14), id=4 servo(CH2).
- * id=5 (CH3) is disabled; CH3 is key-controlled by [k,u,d]/[k,d,d]/[k,x,u].
+/* Parse [s,id,x]:
+ * id=1 -> gimbal (CH9, 0~270), id=2 -> speed percent, id=3 -> upper(CH12),
+ * id=4 -> middle(CH11), id=5 -> lower(CH10).
  */
 static void ProcessServoPacket(char *buf)
 {
+  const char *p = buf;
+  int16_t servoIdVal;
+  int16_t angleVal;
   int servoId;
-  int angleVal;
-  if (buf[0] != '[' || buf[1] != 's' || buf[2] != ',') return;
-  char *end = strchr(buf, ']');
-  if (!end) return;
+  int16_t targetAngle;
 
-  char tmpBuf[32];
-  size_t len = (size_t)(end - (buf + 3));
-  if (len >= sizeof(tmpBuf)) return;
-  memcpy(tmpBuf, buf + 3, len);
-  tmpBuf[len] = '\0';
+  if (p[0] != '[' || AsciiToLowerFast(p[1]) != 's' || p[2] != ',') return;
 
-  if (sscanf(tmpBuf, "%d,%d", &servoId, &angleVal) != 2) return;
+  p += 3;
+  if (ParseSignedInt16Fast(&p, &servoIdVal) == 0U || *p != ',') return;
+  p++;
+  if (ParseSignedInt16Fast(&p, &angleVal) == 0U || *p != ']' || p[1] != '\0') return;
 
-  if (servoId == 2)
+  servoId = (int)servoIdVal;
+
+  if (servoId == SERVO_SLIDER_SPEED_ID)
   {
-    int16_t speedPct = (int16_t)angleVal;
+    int32_t speedPct = (int32_t)angleVal;
     if (speedPct < 0)
     {
-      speedPct = (int16_t)(-speedPct);
+      speedPct = -speedPct;
     }
-    speedPct = ClampSpeedPercent(speedPct);
-    keyDriveSpeedPct = speedPct;
-    return;
-  }
-
-  if (servoId == 3)
-  {
-    int16_t targetAngle = (angleVal < 0) ? 0 : (int16_t)angleVal;
-    int16_t mappedAngle;
-    if (targetAngle > SERVO_TEST_LOGICAL_MAX_ANGLE)
+    if (speedPct > 100)
     {
-      targetAngle = SERVO_TEST_LOGICAL_MAX_ANGLE;
+      speedPct = 100;
     }
+    keyDriveSpeedPct = (int16_t)speedPct;
+    return;
+  }
 
-    mappedAngle = (int16_t)(SERVO_TEST_LOGICAL_MAX_ANGLE - targetAngle);
+  targetAngle = (angleVal < 0) ? 0 : (int16_t)angleVal;
 
-    if (mappedAngle != lastServoAngleCh14)
+  if (servoId == SERVO_SLIDER_GIMBAL_ID)
+  {
+    if (targetAngle > (int16_t)SERVO_ANGLE_270_MAX)
     {
-      (void)ServoSetAngle180ByChannel(SERVO_PACKET_ID3_CHANNEL, (uint16_t)mappedAngle);
-      lastServoAngleCh14 = mappedAngle;
+      targetAngle = (int16_t)SERVO_ANGLE_270_MAX;
     }
-    return;
-  }
 
-  if (servoId == 4)
-  {
-    int16_t targetAngle = (angleVal < 0) ? 0 : (int16_t)angleVal;
-    if (targetAngle > SERVO_TEST_LOGICAL_MAX_ANGLE)
+    if (targetAngle != gimbalLastApplied)
     {
-      targetAngle = SERVO_TEST_LOGICAL_MAX_ANGLE;
+      (void)ServoSetAngle270ByChannel(SERVO_CH_GIMBAL, (uint16_t)targetAngle);
+      gimbalLastApplied = targetAngle;
     }
+    return;
+  }
 
-    if (targetAngle != lastServoAngleCh2)
+  if (targetAngle > (int16_t)SERVO_ANGLE_180_MAX)
+  {
+    targetAngle = (int16_t)SERVO_ANGLE_180_MAX;
+  }
+
+  if (servoId == SERVO_SLIDER_UPPER_ID)
+  {
+    if (targetAngle != upperLastApplied)
     {
-      (void)ServoSetAngle180ByChannel(SERVO_PACKET_ID4_CHANNEL, (uint16_t)targetAngle);
-      lastServoAngleCh2 = targetAngle;
+      (void)ServoSetAngle180ByChannel(SERVO_CH_UPPER, (uint16_t)targetAngle);
+      upperLastApplied = targetAngle;
     }
     return;
   }
 
-  if (servoId == 5)
+  if (servoId == SERVO_SLIDER_MIDDLE_ID)
   {
-    /* CH3 now ignores slider packets and only follows key control packets. */
+    if (targetAngle != middleLastApplied)
+    {
+      (void)ServoSetAngle180ByChannel(SERVO_CH_MIDDLE, (uint16_t)targetAngle);
+      middleLastApplied = targetAngle;
+    }
     return;
   }
 
-  /* Packet [s,1,x] is mapped to clamp servo control. */
-  if (servoId != 1)
+  if (servoId == SERVO_SLIDER_LOWER_ID)
   {
-    return;
-  }
-
-  /* second value controls CH0 angle: clamp to 0~180 for positional servo. */
-  int16_t targetAngle = (angleVal < 0) ? 0 : (int16_t)angleVal;
-  if (targetAngle > SERVO_TEST_LOGICAL_MAX_ANGLE)
-  {
-    targetAngle = SERVO_TEST_LOGICAL_MAX_ANGLE;
-  }
-
-  if (targetAngle != lastServoAngle)
-  {
-    (void)ServoSetAngle180((uint16_t)targetAngle);
-    lastServoAngle = targetAngle;
+    if (targetAngle != lowerLastApplied)
+    {
+      (void)ServoSetAngle180ByChannel(SERVO_CH_LOWER, (uint16_t)targetAngle);
+      lowerLastApplied = targetAngle;
+    }
   }
 }
 
 /* Parse shared packet: format [k,x,y]
- * x: w/s for CH1 key control; q/a for bucket dual-servo.
- * x: u/d for CH3 clamp key control (u=go to close angle, d=go to release angle).
- * x: x with y=u for generic CH3 key release (stop).
- * y: d/u, d = press/start, u = release/stop.
+ * q/e: flower hand angle increase/decrease (continuous while pressed)
+ * u/d: clamp close/open (dual state)
+ * i/o: trunk retract/open (dual state)
+ * y: d/u, d = press, u = release
  */
 static void ProcessDualServoPacket(char *buf)
 {
-  char moveCmdRaw;
-  char stateCmdRaw;
   char moveCmd;
   char stateCmd;
 
-  if (buf[0] != '[' || buf[1] != 'k' || buf[2] != ',') return;
-  if (sscanf(buf, "[k,%c,%c]", &moveCmdRaw, &stateCmdRaw) != 2) return;
+  if (buf[0] != '[' || AsciiToLowerFast(buf[1]) != 'k' || buf[2] != ',') return;
+  if (buf[4] != ',' || buf[6] != ']' || buf[7] != '\0') return;
 
-  moveCmd = (char)tolower((int)moveCmdRaw);
-  stateCmd = (char)tolower((int)stateCmdRaw);
+  moveCmd = AsciiToLowerFast(buf[3]);
+  stateCmd = AsciiToLowerFast(buf[5]);
 
   if (stateCmd == 'u')
   {
-    if (moveCmd == 'x' || moveCmd == 'u' || moveCmd == 'd')
+    if (moveCmd == 'q' || moveCmd == 'e')
     {
-      ch3KeyRunning = 0;
-      ch3KeyDir = 0;
-      return;
-    }
-
-    if (moveCmd == 'w' || moveCmd == 's')
-    {
-      ch1KeyRunning = 0;
-      ch1KeyDir = 0;
-      return;
-    }
-
-    if (moveCmd == 'q' || moveCmd == 'a')
-    {
-      dualServoRunning = 0;
-      dualServoDir = 0;
-      return;
+      flowerRunning = 0;
+      flowerDir = 0;
     }
 
     return;
@@ -1285,84 +1035,66 @@ static void ProcessDualServoPacket(char *buf)
 
   if (moveCmd == 'u')
   {
-    Ch3KeyApplyAbsoluteAngle(CH3_KEY_CTRL_CLAMP_ANGLE);
+    if (clampLastApplied != CLAMP_CLOSE_ANGLE)
+    {
+      (void)ServoSetAngle180ByChannel(SERVO_CH_CLAMP, (uint16_t)CLAMP_CLOSE_ANGLE);
+      clampLastApplied = CLAMP_CLOSE_ANGLE;
+    }
     return;
   }
 
   if (moveCmd == 'd')
   {
-    Ch3KeyApplyAbsoluteAngle(CH3_KEY_CTRL_RELEASE_ANGLE);
+    if (clampLastApplied != CLAMP_OPEN_ANGLE)
+    {
+      (void)ServoSetAngle180ByChannel(SERVO_CH_CLAMP, (uint16_t)CLAMP_OPEN_ANGLE);
+      clampLastApplied = CLAMP_OPEN_ANGLE;
+    }
     return;
   }
 
-  if (moveCmd == 'w')
+  if (moveCmd == 'i')
   {
-    ch1KeyDir = 1;
-    ch1KeyRunning = 1;
-    ch1KeyLastTick = HAL_GetTick();
+    if (trunkLastApplied != TRUNK_RETRACT_ANGLE)
+    {
+      (void)ServoSetAngle180ByChannel(SERVO_CH_TRUNK, (uint16_t)TRUNK_RETRACT_ANGLE);
+      trunkLastApplied = TRUNK_RETRACT_ANGLE;
+    }
     return;
   }
 
-  if (moveCmd == 's')
+  if (moveCmd == 'o')
   {
-    ch1KeyDir = -1;
-    ch1KeyRunning = 1;
-    ch1KeyLastTick = HAL_GetTick();
+    if (trunkLastApplied != TRUNK_OPEN_ANGLE)
+    {
+      (void)ServoSetAngle180ByChannel(SERVO_CH_TRUNK, (uint16_t)TRUNK_OPEN_ANGLE);
+      trunkLastApplied = TRUNK_OPEN_ANGLE;
+    }
     return;
   }
 
   if (moveCmd == 'q')
   {
-    dualServoDir = 1;
-    dualServoRunning = 1;
-    dualServoLastTick = HAL_GetTick();
+    flowerDir = 1;
+    flowerRunning = 1;
+    flowerLastTick = HAL_GetTick();
     return;
   }
 
-  if (moveCmd == 'a')
+  if (moveCmd == 'e')
   {
-    dualServoDir = -1;
-    dualServoRunning = 1;
-    dualServoLastTick = HAL_GetTick();
+    flowerDir = -1;
+    flowerRunning = 1;
+    flowerLastTick = HAL_GetTick();
     return;
   }
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-  if(huart->Instance == USART2)
+  if (huart->Instance == USART2)
   {
     uint8_t byte = rx_data;
-
-    if (byte == MOTOR_PACKET_HEADER)
-    {
-      motor_pkt_in_frame = 1;
-      motor_pkt_idx = 0;
-      motor_pkt_buf[motor_pkt_idx++] = byte;
-    }
-    else if (motor_pkt_in_frame)
-    {
-      if (motor_pkt_idx < MOTOR_PACKET_SIZE)
-      {
-        motor_pkt_buf[motor_pkt_idx++] = byte;
-      }
-
-      if (motor_pkt_idx >= MOTOR_PACKET_SIZE)
-      {
-        uint8_t checksum = motor_pkt_buf[5];
-        uint8_t footer = motor_pkt_buf[6];
-        uint8_t checksumCalc = CalculateChecksumXor(&motor_pkt_buf[1], PAN_TILT_FRAME_SIZE);
-
-        if (footer == MOTOR_PACKET_FOOTER && checksum == checksumCalc)
-        {
-          memcpy((void *)motor_latest_payload, &motor_pkt_buf[1], PAN_TILT_FRAME_SIZE);
-          motor_latest_ready = 1;
-        }
-
-        motor_pkt_in_frame = 0;
-        motor_pkt_idx = 0;
-      }
-    }
 
     if (byte == '[')
     {
@@ -1379,9 +1111,15 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
         if (byte == ']')
         {
-          strncpy((char *)uart_latest_frame, uart_rx_buf, sizeof(uart_latest_frame) - 1);
-          uart_latest_frame[sizeof(uart_latest_frame) - 1] = '\0';
-          uart_latest_ready = 1;
+          uint8_t frameLen = uart_rx_idx;
+          if (frameLen >= (uint8_t)sizeof(uart_latest_frame))
+          {
+            frameLen = (uint8_t)(sizeof(uart_latest_frame) - 1U);
+          }
+          memcpy((void *)uart_latest_frame, uart_rx_buf, frameLen);
+          uart_latest_frame[frameLen] = '\0';
+          uart_latest_len = frameLen;
+          uart_latest_ready = 1U;
           uart_in_frame = 0;
           uart_rx_idx = 0;
           uart_rx_buf[0] = '\0';
@@ -1396,7 +1134,18 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     }
 
     /* restart receive */
-    HAL_UART_Receive_IT(&huart2, &rx_data, 1);
+    StartUartReceive();
+  }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART2)
+  {
+    uart_in_frame = 0U;
+    uart_rx_idx = 0U;
+    uart_rx_buf[0] = '\0';
+    StartUartReceive();
   }
 }
 /* USER CODE END 4 */
