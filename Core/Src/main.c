@@ -90,8 +90,7 @@
 
 /* [k,x,y] shared control packet:
  * x=q/a controls bucket dual-servo, x=w/s controls CH1.
- * x=u/d controls CH3 clamp: u=clamp(close), d=release(open).
- * x=0 with y=x triggers servo state-0 transition.
+ * x=u/d controls CH3 clamp absolute angle: u=clamp(close 100deg), d=release(open 160deg).
  * x=x with y=u means key released, stop CH3 action.
  * y=d/u means press(start)/release(stop).
  */
@@ -113,17 +112,14 @@
 #define CH3_KEY_CTRL_CHANNEL SERVO_PACKET_ID5_CHANNEL
 #define CH3_KEY_CTRL_MIN_ANGLE 0
 #define CH3_KEY_CTRL_MAX_ANGLE 180
+#define CH3_KEY_CTRL_CLAMP_ANGLE 100
+#define CH3_KEY_CTRL_RELEASE_ANGLE 160
 #define CH3_KEY_CTRL_SPEED_DEG_PER_SEC 100
 #define CH3_KEY_CTRL_STEP_PERIOD_MS 20U
 
-#define SERVO_STATE_SYNC_PERIOD_MS 20U
-#define SERVO_STATE_SPEED_DEG_PER_SEC 120
-#define SERVO_STATE0_CH14_ANGLE 19
-#define SERVO_STATE0_CH0_ANGLE 0
-#define SERVO_STATE0_CH2_ANGLE 21
-
-/* Mecanum lateral move speed (used by joystick strafe path). */
-#define K_MECANUM_LATERAL_SPEED_PCT 25
+/* Mecanum lateral speed ratio: strafe = forward/backward * 3/4. */
+#define K_MECANUM_LATERAL_SCALE_NUM 3
+#define K_MECANUM_LATERAL_SCALE_DEN 4
 #define K_FB_LOW_SPEED_DIRECT_THRESHOLD_PCT 30
 
 /* USER CODE END PD */
@@ -363,7 +359,7 @@ static int16_t lastServoAngleCh1 = -1;
 static int16_t lastServoAngleCh14 = -1;
 static int16_t lastServoAngleCh2 = -1;
 static int16_t lastServoAngleCh3 = -1;
-static int16_t keyDriveSpeedPct = 100;
+static int16_t keyDriveSpeedPct = 50;
 static WheelControl_t wheelControl = {0};
 static int32_t dualServoAngleA_mdeg = 0;
 static int16_t dualServoLastAppliedA = -1;
@@ -380,14 +376,6 @@ static int16_t ch3KeyLastApplied = -1;
 static int8_t ch3KeyDir = 0;
 static uint8_t ch3KeyRunning = 0;
 static uint32_t ch3KeyLastTick = 0;
-static uint8_t servoStateTransitionActive = 0;
-static uint32_t servoStateLastTick = 0;
-static int32_t servoStateCh14_mdeg = 0;
-static int32_t servoStateCh0_mdeg = 0;
-static int32_t servoStateCh2_mdeg = 0;
-static int32_t servoStateTargetCh14_mdeg = 0;
-static int32_t servoStateTargetCh0_mdeg = 0;
-static int32_t servoStateTargetCh2_mdeg = 0;
 /* -1: left strafe, 0: stop/normal mode, +1: right strafe */
 static volatile int8_t mecanumLateralCmd = 0;
 /* Direct-drive bypass for modes that should not pass through S-curve. */
@@ -415,9 +403,8 @@ static HAL_StatusTypeDef ServoSetAngle270ByChannel(uint8_t channel, uint16_t ang
 static HAL_StatusTypeDef DualServoApplyComplementAngleA(int16_t angleA);
 static void DualServoSyncStep(void);
 static void Ch1KeySyncStep(void);
+static void Ch3KeyApplyAbsoluteAngle(int16_t targetAngle);
 static void Ch3KeySyncStep(void);
-static void ServoStateStart0(void);
-static void ServoStateSyncStep(void);
 static void ApplyMecanumLateralCommand(int8_t lateralCmd, int16_t fallbackLeftPct, int16_t fallbackRightPct);
 #if SERVO_TEST_ENABLE
 static void RunServoCalibrationTest(void);
@@ -467,179 +454,28 @@ static void ProcessLatestPanTiltPayload(void)
   ProcessPanTiltFrame(payload);
 }
 
-static int16_t ClampServoAngle180Int(int32_t angleDeg)
-{
-  if (angleDeg < 0)
-  {
-    return 0;
-  }
-  if (angleDeg > SERVO_TEST_LOGICAL_MAX_ANGLE)
-  {
-    return SERVO_TEST_LOGICAL_MAX_ANGLE;
-  }
-  return (int16_t)angleDeg;
-}
-
-static int32_t SeedStateServoAngleMdeg(int16_t lastAngle, int16_t fallbackAngle)
-{
-  int16_t seed = (lastAngle >= 0) ? lastAngle : fallbackAngle;
-  return (int32_t)seed * 1000;
-}
-
-static void ServoStateStart0(void)
-{
-  dualServoRunning = 0;
-  dualServoDir = 0;
-  ch1KeyRunning = 0;
-  ch1KeyDir = 0;
-  ch3KeyRunning = 0;
-  ch3KeyDir = 0;
-
-  servoStateTargetCh14_mdeg = (int32_t)SERVO_STATE0_CH14_ANGLE * 1000;
-  servoStateTargetCh0_mdeg = (int32_t)SERVO_STATE0_CH0_ANGLE * 1000;
-  servoStateTargetCh2_mdeg = (int32_t)SERVO_STATE0_CH2_ANGLE * 1000;
-
-  servoStateCh14_mdeg = SeedStateServoAngleMdeg(lastServoAngleCh14, SERVO_STATE0_CH14_ANGLE);
-  servoStateCh0_mdeg = SeedStateServoAngleMdeg(lastServoAngle, SERVO_STATE0_CH0_ANGLE);
-  servoStateCh2_mdeg = SeedStateServoAngleMdeg(lastServoAngleCh2, SERVO_STATE0_CH2_ANGLE);
-
-  servoStateTransitionActive = 1U;
-  servoStateLastTick = HAL_GetTick();
-}
-
-static void ServoStateSyncStep(void)
-{
-  uint32_t nowTick;
-  uint32_t elapsedMs;
-  int32_t deltaMdeg;
-  uint8_t reached = 1U;
-  int16_t angleCh14;
-  int16_t angleCh0;
-  int16_t angleCh2;
-
-  if (servoStateTransitionActive == 0U)
-  {
-    return;
-  }
-
-  nowTick = HAL_GetTick();
-  elapsedMs = nowTick - servoStateLastTick;
-  if (elapsedMs < SERVO_STATE_SYNC_PERIOD_MS)
-  {
-    return;
-  }
-  servoStateLastTick = nowTick;
-
-  deltaMdeg = (int32_t)SERVO_STATE_SPEED_DEG_PER_SEC * (int32_t)elapsedMs;
-  if (deltaMdeg < 1)
-  {
-    deltaMdeg = 1;
-  }
-
-  if (servoStateCh14_mdeg < servoStateTargetCh14_mdeg)
-  {
-    servoStateCh14_mdeg += deltaMdeg;
-    if (servoStateCh14_mdeg > servoStateTargetCh14_mdeg)
-    {
-      servoStateCh14_mdeg = servoStateTargetCh14_mdeg;
-    }
-    reached = 0U;
-  }
-  else if (servoStateCh14_mdeg > servoStateTargetCh14_mdeg)
-  {
-    servoStateCh14_mdeg -= deltaMdeg;
-    if (servoStateCh14_mdeg < servoStateTargetCh14_mdeg)
-    {
-      servoStateCh14_mdeg = servoStateTargetCh14_mdeg;
-    }
-    reached = 0U;
-  }
-
-  if (servoStateCh0_mdeg < servoStateTargetCh0_mdeg)
-  {
-    servoStateCh0_mdeg += deltaMdeg;
-    if (servoStateCh0_mdeg > servoStateTargetCh0_mdeg)
-    {
-      servoStateCh0_mdeg = servoStateTargetCh0_mdeg;
-    }
-    reached = 0U;
-  }
-  else if (servoStateCh0_mdeg > servoStateTargetCh0_mdeg)
-  {
-    servoStateCh0_mdeg -= deltaMdeg;
-    if (servoStateCh0_mdeg < servoStateTargetCh0_mdeg)
-    {
-      servoStateCh0_mdeg = servoStateTargetCh0_mdeg;
-    }
-    reached = 0U;
-  }
-
-  if (servoStateCh2_mdeg < servoStateTargetCh2_mdeg)
-  {
-    servoStateCh2_mdeg += deltaMdeg;
-    if (servoStateCh2_mdeg > servoStateTargetCh2_mdeg)
-    {
-      servoStateCh2_mdeg = servoStateTargetCh2_mdeg;
-    }
-    reached = 0U;
-  }
-  else if (servoStateCh2_mdeg > servoStateTargetCh2_mdeg)
-  {
-    servoStateCh2_mdeg -= deltaMdeg;
-    if (servoStateCh2_mdeg < servoStateTargetCh2_mdeg)
-    {
-      servoStateCh2_mdeg = servoStateTargetCh2_mdeg;
-    }
-    reached = 0U;
-  }
-
-  angleCh14 = ClampServoAngle180Int(servoStateCh14_mdeg / 1000);
-  angleCh0 = ClampServoAngle180Int(servoStateCh0_mdeg / 1000);
-  angleCh2 = ClampServoAngle180Int(servoStateCh2_mdeg / 1000);
-
-  if (angleCh14 != lastServoAngleCh14)
-  {
-    (void)ServoSetAngle180ByChannel(SERVO_PACKET_ID3_CHANNEL, (uint16_t)angleCh14);
-    lastServoAngleCh14 = angleCh14;
-  }
-
-  if (angleCh0 != lastServoAngle)
-  {
-    (void)ServoSetAngle180((uint16_t)angleCh0);
-    lastServoAngle = angleCh0;
-  }
-
-  if (angleCh2 != lastServoAngleCh2)
-  {
-    (void)ServoSetAngle180ByChannel(SERVO_PACKET_ID4_CHANNEL, (uint16_t)angleCh2);
-    lastServoAngleCh2 = angleCh2;
-  }
-
-  if (reached != 0U)
-  {
-    servoStateTransitionActive = 0U;
-  }
-}
-
 static void ApplyMecanumLateralCommand(int8_t lateralCmd, int16_t fallbackLeftPct, int16_t fallbackRightPct)
 {
+  int16_t lateralPct = (int16_t)((((int32_t)keyDriveSpeedPct * K_MECANUM_LATERAL_SCALE_NUM) + (K_MECANUM_LATERAL_SCALE_DEN / 2)) / K_MECANUM_LATERAL_SCALE_DEN);
+  lateralPct = ClampSpeedPercent(lateralPct);
+
   if (lateralCmd < 0)
   {
     /* Left strafe: FL-, RL+, FR+, RR- */
-    SetSpeed_LA(-K_MECANUM_LATERAL_SPEED_PCT);
-    SetSpeed_LB(K_MECANUM_LATERAL_SPEED_PCT);
-    SetSpeed_RA(K_MECANUM_LATERAL_SPEED_PCT);
-    SetSpeed_RB(-K_MECANUM_LATERAL_SPEED_PCT);
+    SetSpeed_LA((int16_t)(-lateralPct));
+    SetSpeed_LB(lateralPct);
+    SetSpeed_RA(lateralPct);
+    SetSpeed_RB((int16_t)(-lateralPct));
     return;
   }
 
   if (lateralCmd > 0)
   {
     /* Right strafe: FL+, RL-, FR-, RR+ */
-    SetSpeed_LA(K_MECANUM_LATERAL_SPEED_PCT);
-    SetSpeed_LB(-K_MECANUM_LATERAL_SPEED_PCT);
-    SetSpeed_RA(-K_MECANUM_LATERAL_SPEED_PCT);
-    SetSpeed_RB(K_MECANUM_LATERAL_SPEED_PCT);
+    SetSpeed_LA(lateralPct);
+    SetSpeed_LB((int16_t)(-lateralPct));
+    SetSpeed_RA((int16_t)(-lateralPct));
+    SetSpeed_RB(lateralPct);
     return;
   }
 
@@ -727,11 +563,6 @@ static void ProcessPanTiltFrame(const uint8_t frame[PAN_TILT_FRAME_SIZE])
 {
   uint16_t pan = (uint16_t)frame[0] | ((uint16_t)frame[1] << 8);
   uint16_t tilt = (uint16_t)frame[2] | ((uint16_t)frame[3] << 8);
-
-  if (servoStateTransitionActive != 0U)
-  {
-    return;
-  }
 
   if (pan > PAN_MAX_ANGLE)
   {
@@ -871,6 +702,26 @@ static void Ch1KeySyncStep(void)
     ch1KeyLastApplied = nextAngle;
     lastServoAngleCh1 = nextAngle;
   }
+}
+
+static void Ch3KeyApplyAbsoluteAngle(int16_t targetAngle)
+{
+  if (targetAngle < CH3_KEY_CTRL_MIN_ANGLE)
+  {
+    targetAngle = CH3_KEY_CTRL_MIN_ANGLE;
+  }
+  else if (targetAngle > CH3_KEY_CTRL_MAX_ANGLE)
+  {
+    targetAngle = CH3_KEY_CTRL_MAX_ANGLE;
+  }
+
+  ch3KeyAngle_mdeg = (int32_t)targetAngle * 1000;
+  ch3KeyLastApplied = targetAngle;
+  lastServoAngleCh3 = targetAngle;
+  ch3KeyRunning = 0;
+  ch3KeyDir = 0;
+  ch3KeyLastTick = HAL_GetTick();
+  (void)ServoSetAngle180ByChannel(CH3_KEY_CTRL_CHANNEL, (uint16_t)targetAngle);
 }
 
 static void Ch3KeySyncStep(void)
@@ -1045,11 +896,7 @@ int main(void)
   ch1KeyRunning = 0;
   ch1KeyDir = 0;
   ch1KeyLastTick = HAL_GetTick();
-  ch3KeyRunning = 0;
-  ch3KeyDir = 0;
-  ch3KeyLastTick = HAL_GetTick();
-  servoStateTransitionActive = 0U;
-  servoStateLastTick = HAL_GetTick();
+  Ch3KeyApplyAbsoluteAngle(CH3_KEY_CTRL_RELEASE_ANGLE);
   mecanumLateralCmd = 0;
   HAL_UART_Receive_IT(&huart2, &rx_data, 1);
   
@@ -1091,7 +938,6 @@ int main(void)
     }
 
     ApplyMecanumLateralCommand(mecanumLateralCmd, applyLeftPct, applyRightPct);
-    ServoStateSyncStep();
     DualServoSyncStep();
     Ch1KeySyncStep();
     Ch3KeySyncStep();
@@ -1228,32 +1074,29 @@ static void ProcessJoystickPacket(char *buf)
     mecanumLateralCmd = 0;
   }
 
-  if (servoStateTransitionActive == 0U)
+  /* Reverse CH1 mapping: up decreases angle, down increases angle. */
+  if (avgRy >= JOY_RY_CH1_ACTIVE_THRESHOLD_PCT)
   {
-    /* Reverse CH1 mapping: up decreases angle, down increases angle. */
-    if (avgRy >= JOY_RY_CH1_ACTIVE_THRESHOLD_PCT)
+    if (ch1KeyDir != -1 || ch1KeyRunning == 0U)
     {
-      if (ch1KeyDir != -1 || ch1KeyRunning == 0U)
-      {
-        ch1KeyDir = -1;
-        ch1KeyRunning = 1;
-        ch1KeyLastTick = HAL_GetTick();
-      }
+      ch1KeyDir = -1;
+      ch1KeyRunning = 1;
+      ch1KeyLastTick = HAL_GetTick();
     }
-    else if (avgRy <= -JOY_RY_CH1_ACTIVE_THRESHOLD_PCT)
+  }
+  else if (avgRy <= -JOY_RY_CH1_ACTIVE_THRESHOLD_PCT)
+  {
+    if (ch1KeyDir != 1 || ch1KeyRunning == 0U)
     {
-      if (ch1KeyDir != 1 || ch1KeyRunning == 0U)
-      {
-        ch1KeyDir = 1;
-        ch1KeyRunning = 1;
-        ch1KeyLastTick = HAL_GetTick();
-      }
+      ch1KeyDir = 1;
+      ch1KeyRunning = 1;
+      ch1KeyLastTick = HAL_GetTick();
     }
-    else
-    {
-      ch1KeyDir = 0;
-      ch1KeyRunning = 0;
-    }
+  }
+  else
+  {
+    ch1KeyDir = 0;
+    ch1KeyRunning = 0;
   }
 
   if (mecanumLateralCmd != 0)
@@ -1305,7 +1148,6 @@ static void ProcessServoPacket(char *buf)
 {
   int servoId;
   int angleVal;
-  if (servoStateTransitionActive != 0U) return;
   if (buf[0] != '[' || buf[1] != 's' || buf[2] != ',') return;
   char *end = strchr(buf, ']');
   if (!end) return;
@@ -1393,7 +1235,7 @@ static void ProcessServoPacket(char *buf)
 
 /* Parse shared packet: format [k,x,y]
  * x: w/s for CH1 key control; q/a for bucket dual-servo.
- * x: u/d for CH3 clamp key control (u=clamp(close), d=release(open)).
+ * x: u/d for CH3 clamp key control (u=go to close angle, d=go to release angle).
  * x: x with y=u for generic CH3 key release (stop).
  * y: d/u, d = press/start, u = release/stop.
  */
@@ -1409,20 +1251,6 @@ static void ProcessDualServoPacket(char *buf)
 
   moveCmd = (char)tolower((int)moveCmdRaw);
   stateCmd = (char)tolower((int)stateCmdRaw);
-
-  if (moveCmd == '0')
-  {
-    if (stateCmd == 'x' || stateCmd == 'd')
-    {
-      ServoStateStart0();
-    }
-    return;
-  }
-
-  if (servoStateTransitionActive != 0U)
-  {
-    return;
-  }
 
   if (stateCmd == 'u')
   {
@@ -1457,31 +1285,13 @@ static void ProcessDualServoPacket(char *buf)
 
   if (moveCmd == 'u')
   {
-    if (ch3KeyLastApplied < 0)
-    {
-      int16_t seedAngle = (lastServoAngleCh3 >= 0) ? lastServoAngleCh3 : (CH3_KEY_CTRL_MAX_ANGLE / 2);
-      ch3KeyAngle_mdeg = (int32_t)seedAngle * 1000;
-      ch3KeyLastApplied = seedAngle;
-      lastServoAngleCh3 = seedAngle;
-    }
-    ch3KeyDir = -1;
-    ch3KeyRunning = 1;
-    ch3KeyLastTick = HAL_GetTick();
+    Ch3KeyApplyAbsoluteAngle(CH3_KEY_CTRL_CLAMP_ANGLE);
     return;
   }
 
   if (moveCmd == 'd')
   {
-    if (ch3KeyLastApplied < 0)
-    {
-      int16_t seedAngle = (lastServoAngleCh3 >= 0) ? lastServoAngleCh3 : (CH3_KEY_CTRL_MAX_ANGLE / 2);
-      ch3KeyAngle_mdeg = (int32_t)seedAngle * 1000;
-      ch3KeyLastApplied = seedAngle;
-      lastServoAngleCh3 = seedAngle;
-    }
-    ch3KeyDir = 1;
-    ch3KeyRunning = 1;
-    ch3KeyLastTick = HAL_GetTick();
+    Ch3KeyApplyAbsoluteAngle(CH3_KEY_CTRL_RELEASE_ANGLE);
     return;
   }
 
