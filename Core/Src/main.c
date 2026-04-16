@@ -36,6 +36,12 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef struct
+{
+  float filteredInputRaw;
+  uint16_t targetInputRaw;
+  uint8_t initialized;
+} ServoSliderLpfState_t;
 
 /* USER CODE END PTD */
 
@@ -56,6 +62,13 @@
 #define SERVO_MAX_PULSE_US 2500U
 #define SERVO_ANGLE_180_MAX 180U
 #define SERVO_ANGLE_270_MAX 270U
+/* Slider input range from Bluetooth packets [s,id,x]/[f,id,x].
+ * Default uses angle-like range 0~180; if app sends ADC raw set MAX to 4095.
+ */
+#define SERVO_SLIDER_INPUT_MIN 0U
+#define SERVO_SLIDER_INPUT_MAX 180U
+/* 0~1: smaller alpha gives smoother but slower response. */
+#define SERVO_SLIDER_LPF_ALPHA 0.18f
 
 #define SERVO_SLIDER_GIMBAL_ID 1
 #define SERVO_SLIDER_SPEED_ID 2
@@ -327,6 +340,9 @@ static int16_t middleLastApplied = -1;
 static int16_t lowerLastApplied = -1;
 static int16_t clampLastApplied = -1;
 static int16_t trunkLastApplied = -1;
+static ServoSliderLpfState_t upperSliderLpf = {0};
+static ServoSliderLpfState_t middleSliderLpf = {0};
+static ServoSliderLpfState_t lowerSliderLpf = {0};
 static int32_t flowerAngle_mdeg = 0;
 static int16_t flowerLastApplied = -1;
 static int8_t flowerDir = 0;
@@ -347,6 +363,7 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 static void ProcessJoystickPacket(char *buf);
 static void ProcessServoPacket(char *buf);
+static void ProcessServoFinalPacket(char *buf);
 static void ProcessDualServoPacket(char *buf);
 static void ProcessUartBytes(void);
 static void ProcessLatestUartFrame(void);
@@ -356,6 +373,24 @@ static void StartUartReceive(void);
 static HAL_StatusTypeDef ServoSetAngle180ByChannel(uint8_t channel, uint16_t angleDeg);
 static HAL_StatusTypeDef ServoSetAngle270ByChannel(uint8_t channel, uint16_t angleDeg);
 static HAL_StatusTypeDef ServoSetPulseUsByChannel(uint8_t channel, uint16_t pulseUs);
+static uint16_t ClampServoSliderInputRaw(int16_t inputRaw);
+static uint16_t ServoSliderLowPassUpdate(ServoSliderLpfState_t *state);
+static uint16_t ServoSliderInputToAngle180(uint16_t inputRaw);
+static uint16_t ServoSliderAngle180ToInput(uint16_t angleDeg);
+static void ServoSliderSetTargetInput(ServoSliderLpfState_t *state,
+                                      int16_t inputRaw,
+                                      int16_t currentAngleDeg);
+static void ServoSliderApplySmoothedAngle180(uint8_t channel,
+                                             ServoSliderLpfState_t *state,
+                                             int16_t *lastAppliedAngle);
+static void UpdateServo180ByFilteredSliderInput(uint8_t channel,
+                                              int16_t inputRaw,
+                                              ServoSliderLpfState_t *filterState,
+                                              int16_t *lastAppliedAngle);
+static void UpdateServo180ByFinalSliderInput(uint8_t channel,
+                                           int16_t inputRaw,
+                                           ServoSliderLpfState_t *filterState,
+                                           int16_t *lastAppliedAngle);
 static void FlowerHandSyncStep(void);
 static void ApplyMecanumLateralCommand(int8_t lateralCmd, int16_t fallbackLeftPct, int16_t fallbackRightPct);
 
@@ -496,6 +531,10 @@ static void ProcessLatestUartFrame(void)
   {
     ProcessServoPacket(frame);
   }
+  else if (AsciiToLowerFast(frame[1]) == 'f')
+  {
+    ProcessServoFinalPacket(frame);
+  }
   else if (AsciiToLowerFast(frame[1]) == 'k')
   {
     ProcessDualServoPacket(frame);
@@ -545,6 +584,179 @@ static HAL_StatusTypeDef ServoSetAngle270ByChannel(uint8_t channel, uint16_t ang
              SERVO_ANGLE_270_MAX);
 
   return ServoSetPulseUsByChannel(channel, (uint16_t)pulseUs);
+}
+
+static uint16_t ClampServoSliderInputRaw(int16_t inputRaw)
+{
+  if (inputRaw <= (int16_t)SERVO_SLIDER_INPUT_MIN)
+  {
+    return SERVO_SLIDER_INPUT_MIN;
+  }
+
+  if (inputRaw >= (int16_t)SERVO_SLIDER_INPUT_MAX)
+  {
+    return SERVO_SLIDER_INPUT_MAX;
+  }
+
+  return (uint16_t)inputRaw;
+}
+
+static uint16_t ServoSliderLowPassUpdate(ServoSliderLpfState_t *state)
+{
+  float alpha = SERVO_SLIDER_LPF_ALPHA;
+  float filtered;
+
+  if (state == NULL || state->initialized == 0U)
+  {
+    return SERVO_SLIDER_INPUT_MIN;
+  }
+
+  if (alpha < 0.0f)
+  {
+    alpha = 0.0f;
+  }
+  else if (alpha > 1.0f)
+  {
+    alpha = 1.0f;
+  }
+
+  state->filteredInputRaw += alpha * ((float)state->targetInputRaw - state->filteredInputRaw);
+
+  filtered = state->filteredInputRaw;
+  if (filtered < (float)SERVO_SLIDER_INPUT_MIN)
+  {
+    filtered = (float)SERVO_SLIDER_INPUT_MIN;
+  }
+  else if (filtered > (float)SERVO_SLIDER_INPUT_MAX)
+  {
+    filtered = (float)SERVO_SLIDER_INPUT_MAX;
+  }
+
+  return (uint16_t)(filtered + 0.5f);
+}
+
+static uint16_t ServoSliderInputToAngle180(uint16_t inputRaw)
+{
+  uint32_t inputSpan = (uint32_t)(SERVO_SLIDER_INPUT_MAX - SERVO_SLIDER_INPUT_MIN);
+  uint32_t angle;
+
+  if (inputRaw <= SERVO_SLIDER_INPUT_MIN)
+  {
+    return 0U;
+  }
+
+  if (inputRaw >= SERVO_SLIDER_INPUT_MAX)
+  {
+    return SERVO_ANGLE_180_MAX;
+  }
+
+  angle = ((uint32_t)(inputRaw - SERVO_SLIDER_INPUT_MIN) * SERVO_ANGLE_180_MAX + (inputSpan / 2U)) / inputSpan;
+  return (uint16_t)angle;
+}
+
+static uint16_t ServoSliderAngle180ToInput(uint16_t angleDeg)
+{
+  uint32_t inputSpan = (uint32_t)(SERVO_SLIDER_INPUT_MAX - SERVO_SLIDER_INPUT_MIN);
+  uint32_t inputRaw;
+
+  if (angleDeg > SERVO_ANGLE_180_MAX)
+  {
+    angleDeg = SERVO_ANGLE_180_MAX;
+  }
+
+  inputRaw = SERVO_SLIDER_INPUT_MIN +
+             ((inputSpan * (uint32_t)angleDeg + (SERVO_ANGLE_180_MAX / 2U)) / SERVO_ANGLE_180_MAX);
+  return (uint16_t)inputRaw;
+}
+
+static void ServoSliderSetTargetInput(ServoSliderLpfState_t *state,
+                                      int16_t inputRaw,
+                                      int16_t currentAngleDeg)
+{
+  uint16_t inputRawClamped;
+  uint16_t startAngle;
+
+  if (state == NULL)
+  {
+    return;
+  }
+
+  inputRawClamped = ClampServoSliderInputRaw(inputRaw);
+
+  if (state->initialized == 0U)
+  {
+    if (currentAngleDeg < 0)
+    {
+      startAngle = 0U;
+    }
+    else
+    {
+      startAngle = (uint16_t)currentAngleDeg;
+      if (startAngle > SERVO_ANGLE_180_MAX)
+      {
+        startAngle = SERVO_ANGLE_180_MAX;
+      }
+    }
+
+    state->filteredInputRaw = (float)ServoSliderAngle180ToInput(startAngle);
+    state->initialized = 1U;
+  }
+
+  state->targetInputRaw = inputRawClamped;
+}
+
+static void ServoSliderApplySmoothedAngle180(uint8_t channel,
+                                             ServoSliderLpfState_t *state,
+                                             int16_t *lastAppliedAngle)
+{
+  uint16_t inputRawFiltered;
+  uint16_t targetAngle;
+
+  if (state == NULL || lastAppliedAngle == NULL || state->initialized == 0U)
+  {
+    return;
+  }
+
+  inputRawFiltered = ServoSliderLowPassUpdate(state);
+  targetAngle = ServoSliderInputToAngle180(inputRawFiltered);
+
+  if ((int16_t)targetAngle != *lastAppliedAngle)
+  {
+    (void)ServoSetAngle180ByChannel(channel, targetAngle);
+    *lastAppliedAngle = (int16_t)targetAngle;
+  }
+}
+
+static void UpdateServo180ByFilteredSliderInput(uint8_t channel,
+                                              int16_t inputRaw,
+                                              ServoSliderLpfState_t *filterState,
+                                              int16_t *lastAppliedAngle)
+{
+  (void)channel;
+
+  if (lastAppliedAngle == NULL)
+  {
+    return;
+  }
+
+  /* Process packet only updates target; smoothing step runs in main loop. */
+  ServoSliderSetTargetInput(filterState, inputRaw, *lastAppliedAngle);
+}
+
+static void UpdateServo180ByFinalSliderInput(uint8_t channel,
+                                           int16_t inputRaw,
+                                           ServoSliderLpfState_t *filterState,
+                                           int16_t *lastAppliedAngle)
+{
+  (void)channel;
+
+  if (lastAppliedAngle == NULL)
+  {
+    return;
+  }
+
+  /* Final packet also updates target; motion stays smooth and converges. */
+  ServoSliderSetTargetInput(filterState, inputRaw, *lastAppliedAngle);
 }
 
 static void FlowerHandSyncStep(void)
@@ -731,6 +943,9 @@ int main(void)
     }
 
     ApplyMecanumLateralCommand(mecanumLateralCmd, applyLeftPct, applyRightPct);
+    ServoSliderApplySmoothedAngle180(SERVO_CH_UPPER, &upperSliderLpf, &upperLastApplied);
+    ServoSliderApplySmoothedAngle180(SERVO_CH_MIDDLE, &middleSliderLpf, &middleLastApplied);
+    ServoSliderApplySmoothedAngle180(SERVO_CH_LOWER, &lowerSliderLpf, &lowerLastApplied);
     FlowerHandSyncStep();
     SpeedA = applyLeftPct;
     SpeedB = applyRightPct;
@@ -912,15 +1127,15 @@ static void ProcessJoystickPacket(char *buf)
   */
 }
 
-/* Parse [s,id,x]:
- * id=1 -> gimbal (CH9, 0~270), id=2 -> speed percent, id=3 -> upper(CH12),
- * id=4 -> middle(CH11), id=5 -> lower(CH10).
+/* Parse process packet [s,id,x]:
+ * id=1 -> gimbal angle (CH9, 0~270), id=2 -> speed percent,
+ * id=3/4/5 -> upper/middle/lower slider input value.
  */
 static void ProcessServoPacket(char *buf)
 {
   const char *p = buf;
   int16_t servoIdVal;
-  int16_t angleVal;
+  int16_t inputVal;
   int servoId;
   int16_t targetAngle;
 
@@ -929,13 +1144,13 @@ static void ProcessServoPacket(char *buf)
   p += 3;
   if (ParseSignedInt16Fast(&p, &servoIdVal) == 0U || *p != ',') return;
   p++;
-  if (ParseSignedInt16Fast(&p, &angleVal) == 0U || *p != ']' || p[1] != '\0') return;
+  if (ParseSignedInt16Fast(&p, &inputVal) == 0U || *p != ']' || p[1] != '\0') return;
 
   servoId = (int)servoIdVal;
 
   if (servoId == SERVO_SLIDER_SPEED_ID)
   {
-    int32_t speedPct = (int32_t)angleVal;
+    int32_t speedPct = (int32_t)inputVal;
     if (speedPct < 0)
     {
       speedPct = -speedPct;
@@ -948,10 +1163,10 @@ static void ProcessServoPacket(char *buf)
     return;
   }
 
-  targetAngle = (angleVal < 0) ? 0 : (int16_t)angleVal;
-
   if (servoId == SERVO_SLIDER_GIMBAL_ID)
   {
+    targetAngle = (inputVal < 0) ? 0 : (int16_t)inputVal;
+
     if (targetAngle > (int16_t)SERVO_ANGLE_270_MAX)
     {
       targetAngle = (int16_t)SERVO_ANGLE_270_MAX;
@@ -965,38 +1180,76 @@ static void ProcessServoPacket(char *buf)
     return;
   }
 
-  if (targetAngle > (int16_t)SERVO_ANGLE_180_MAX)
-  {
-    targetAngle = (int16_t)SERVO_ANGLE_180_MAX;
-  }
-
   if (servoId == SERVO_SLIDER_UPPER_ID)
   {
-    if (targetAngle != upperLastApplied)
-    {
-      (void)ServoSetAngle180ByChannel(SERVO_CH_UPPER, (uint16_t)targetAngle);
-      upperLastApplied = targetAngle;
-    }
+    UpdateServo180ByFilteredSliderInput(SERVO_CH_UPPER,
+                                      inputVal,
+                                      &upperSliderLpf,
+                                      &upperLastApplied);
     return;
   }
 
   if (servoId == SERVO_SLIDER_MIDDLE_ID)
   {
-    if (targetAngle != middleLastApplied)
-    {
-      (void)ServoSetAngle180ByChannel(SERVO_CH_MIDDLE, (uint16_t)targetAngle);
-      middleLastApplied = targetAngle;
-    }
+    UpdateServo180ByFilteredSliderInput(SERVO_CH_MIDDLE,
+                                      inputVal,
+                                      &middleSliderLpf,
+                                      &middleLastApplied);
     return;
   }
 
   if (servoId == SERVO_SLIDER_LOWER_ID)
   {
-    if (targetAngle != lowerLastApplied)
-    {
-      (void)ServoSetAngle180ByChannel(SERVO_CH_LOWER, (uint16_t)targetAngle);
-      lowerLastApplied = targetAngle;
-    }
+    UpdateServo180ByFilteredSliderInput(SERVO_CH_LOWER,
+                                      inputVal,
+                                      &lowerSliderLpf,
+                                      &lowerLastApplied);
+  }
+}
+
+/* Parse final packet [f,id,x]:
+ * id=3/4/5 -> upper/middle/lower final slider input value.
+ */
+static void ProcessServoFinalPacket(char *buf)
+{
+  const char *p = buf;
+  int16_t servoIdVal;
+  int16_t inputVal;
+  int servoId;
+
+  if (p[0] != '[' || AsciiToLowerFast(p[1]) != 'f' || p[2] != ',') return;
+
+  p += 3;
+  if (ParseSignedInt16Fast(&p, &servoIdVal) == 0U || *p != ',') return;
+  p++;
+  if (ParseSignedInt16Fast(&p, &inputVal) == 0U || *p != ']' || p[1] != '\0') return;
+
+  servoId = (int)servoIdVal;
+
+  if (servoId == SERVO_SLIDER_UPPER_ID)
+  {
+    UpdateServo180ByFinalSliderInput(SERVO_CH_UPPER,
+                                   inputVal,
+                                   &upperSliderLpf,
+                                   &upperLastApplied);
+    return;
+  }
+
+  if (servoId == SERVO_SLIDER_MIDDLE_ID)
+  {
+    UpdateServo180ByFinalSliderInput(SERVO_CH_MIDDLE,
+                                   inputVal,
+                                   &middleSliderLpf,
+                                   &middleLastApplied);
+    return;
+  }
+
+  if (servoId == SERVO_SLIDER_LOWER_ID)
+  {
+    UpdateServo180ByFinalSliderInput(SERVO_CH_LOWER,
+                                   inputVal,
+                                   &lowerSliderLpf,
+                                   &lowerLastApplied);
   }
 }
 
