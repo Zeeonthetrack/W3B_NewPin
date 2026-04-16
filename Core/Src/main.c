@@ -43,6 +43,18 @@ typedef struct
   uint8_t initialized;
 } ServoSliderLpfState_t;
 
+typedef struct
+{
+  uint16_t stateId;
+  uint16_t gimbalAngleDeg;
+  uint16_t upperAngleDeg;
+  uint16_t middleAngleDeg;
+  uint16_t lowerAngleDeg;
+  uint16_t flowerAngleDeg;
+  uint16_t clampAngleDeg;
+  uint16_t trunkAngleDeg;
+} ServoStatePreset_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -84,9 +96,9 @@ typedef struct
 #define SERVO_CH_FLOWER 14U
 #define SERVO_CH_CLAMP 15U
 
-#define FLOWER_MIN_ANGLE 0
-#define FLOWER_MAX_ANGLE 90
-#define FLOWER_INIT_ANGLE 45
+#define FLOWER_MIN_ANGLE 90
+#define FLOWER_MAX_ANGLE 180
+#define FLOWER_INIT_ANGLE 180
 #define FLOWER_SPEED_DEG_PER_SEC 20
 #define FLOWER_STEP_PERIOD_MS 20U
 
@@ -99,6 +111,24 @@ typedef struct
 #define UPPER_INIT_ANGLE 90U
 #define MIDDLE_INIT_ANGLE 90U
 #define LOWER_INIT_ANGLE 90U
+
+#define SERVO_STATE_KEEP_ANGLE 0xFFFFU
+
+/* Bluetooth state packet: (x), x is state id. */
+/* Add more states with SERVO_STATE_n_* macros, then append into servoStatePresets[]. */
+#define SERVO_STATE_1_ID 1U
+#define SERVO_STATE_1_GIMBAL_ANGLE SERVO_STATE_KEEP_ANGLE
+#define SERVO_STATE_1_UPPER_ANGLE 132U
+#define SERVO_STATE_1_MIDDLE_ANGLE 14U
+#define SERVO_STATE_1_LOWER_ANGLE 90U
+#define SERVO_STATE_1_FLOWER_ANGLE SERVO_STATE_KEEP_ANGLE
+#define SERVO_STATE_1_CLAMP_ANGLE SERVO_STATE_KEEP_ANGLE
+#define SERVO_STATE_1_TRUNK_ANGLE SERVO_STATE_KEEP_ANGLE
+
+/* State transition smoothing: servo angle changes use limited speed instead of jump. */
+#define SERVO_STATE_TRANSITION_SPEED_DPS 45U
+#define SERVO_STATE_TRANSITION_PERIOD_MS 20U
+#define SERVO_STATE_TARGET_INVALID (-1)
 
 /* Mecanum lateral speed ratio: strafe = forward/backward * 3/4. */
 #define K_MECANUM_LATERAL_SCALE_NUM 3
@@ -321,6 +351,7 @@ int16_t SpeedB = 0;
 static char uart_rx_buf[UART_FRAME_BUF_SIZE];
 static uint8_t uart_rx_idx = 0;
 static uint8_t uart_in_frame = 0;
+static uint8_t uart_frame_end = 0;
 /* mailbox: always keep only latest completed frame */
 static volatile char uart_latest_frame[UART_FRAME_BUF_SIZE];
 static volatile uint8_t uart_latest_ready = 0;
@@ -355,6 +386,28 @@ static int16_t directDriveLeftPct = 0;
 static int16_t directDriveRightPct = 0;
 static uint8_t directDriveEnabled = 0;
 // static uint32_t last_oled_update_tick = 0;
+static int16_t stateTargetGimbal = SERVO_STATE_TARGET_INVALID;
+static int16_t stateTargetUpper = SERVO_STATE_TARGET_INVALID;
+static int16_t stateTargetMiddle = SERVO_STATE_TARGET_INVALID;
+static int16_t stateTargetLower = SERVO_STATE_TARGET_INVALID;
+static int16_t stateTargetFlower = SERVO_STATE_TARGET_INVALID;
+static int16_t stateTargetClamp = SERVO_STATE_TARGET_INVALID;
+static int16_t stateTargetTrunk = SERVO_STATE_TARGET_INVALID;
+static uint32_t stateTransitionLastTick = 0;
+
+static const ServoStatePreset_t servoStatePresets[] =
+{
+  {
+    SERVO_STATE_1_ID,
+    SERVO_STATE_1_GIMBAL_ANGLE,
+    SERVO_STATE_1_UPPER_ANGLE,
+    SERVO_STATE_1_MIDDLE_ANGLE,
+    SERVO_STATE_1_LOWER_ANGLE,
+    SERVO_STATE_1_FLOWER_ANGLE,
+    SERVO_STATE_1_CLAMP_ANGLE,
+    SERVO_STATE_1_TRUNK_ANGLE
+  }
+};
 
 /* USER CODE END PV */
 
@@ -365,6 +418,7 @@ static void ProcessJoystickPacket(char *buf);
 static void ProcessServoPacket(char *buf);
 static void ProcessServoFinalPacket(char *buf);
 static void ProcessDualServoPacket(char *buf);
+static void ProcessStatePacket(const char *buf);
 static void ProcessUartBytes(void);
 static void ProcessLatestUartFrame(void);
 static uint8_t ParseSignedInt16Fast(const char **cursor, int16_t *outValue);
@@ -393,6 +447,19 @@ static void UpdateServo180ByFinalSliderInput(uint8_t channel,
                                            int16_t *lastAppliedAngle);
 static void FlowerHandSyncStep(void);
 static void ApplyMecanumLateralCommand(int8_t lateralCmd, int16_t fallbackLeftPct, int16_t fallbackRightPct);
+static const ServoStatePreset_t *FindServoStatePreset(uint16_t stateId);
+static void ApplyStateServoAngle180(uint8_t channel,
+                                    uint16_t targetAngle,
+                                    int16_t *lastAppliedAngle,
+                                    ServoSliderLpfState_t *filterState);
+static void ApplyStateServoAngle270(uint8_t channel,
+                                    uint16_t targetAngle,
+                                    int16_t *lastAppliedAngle);
+static void ApplyServoStatePreset(const ServoStatePreset_t *preset);
+static int16_t MoveAngleTowardTarget(int16_t currentAngle,
+                                     int16_t targetAngle,
+                                     uint16_t maxStepDeg);
+static void ServoStateTransitionStep(void);
 
 /* USER CODE END PFP */
 
@@ -497,6 +564,340 @@ static void ApplyMecanumLateralCommand(int8_t lateralCmd, int16_t fallbackLeftPc
   SetSpeed_R(fallbackRightPct);
 }
 
+static const ServoStatePreset_t *FindServoStatePreset(uint16_t stateId)
+{
+  uint32_t i;
+
+  for (i = 0U; i < (uint32_t)(sizeof(servoStatePresets) / sizeof(servoStatePresets[0])); i++)
+  {
+    if (servoStatePresets[i].stateId == stateId)
+    {
+      return &servoStatePresets[i];
+    }
+  }
+
+  return NULL;
+}
+
+static void ApplyStateServoAngle180(uint8_t channel,
+                                    uint16_t targetAngle,
+                                    int16_t *lastAppliedAngle,
+                                    ServoSliderLpfState_t *filterState)
+{
+  uint16_t angleDeg;
+  uint16_t inputRaw;
+
+  if (targetAngle == SERVO_STATE_KEEP_ANGLE || lastAppliedAngle == NULL)
+  {
+    return;
+  }
+
+  angleDeg = targetAngle;
+  if (angleDeg > SERVO_ANGLE_180_MAX)
+  {
+    angleDeg = SERVO_ANGLE_180_MAX;
+  }
+
+  if ((int16_t)angleDeg != *lastAppliedAngle)
+  {
+    (void)ServoSetAngle180ByChannel(channel, angleDeg);
+    *lastAppliedAngle = (int16_t)angleDeg;
+  }
+
+  if (filterState != NULL)
+  {
+    inputRaw = ServoSliderAngle180ToInput(angleDeg);
+    filterState->targetInputRaw = inputRaw;
+    filterState->filteredInputRaw = (float)inputRaw;
+    filterState->initialized = 1U;
+  }
+}
+
+static void ApplyStateServoAngle270(uint8_t channel,
+                                    uint16_t targetAngle,
+                                    int16_t *lastAppliedAngle)
+{
+  uint16_t angleDeg;
+
+  if (targetAngle == SERVO_STATE_KEEP_ANGLE || lastAppliedAngle == NULL)
+  {
+    return;
+  }
+
+  angleDeg = targetAngle;
+  if (angleDeg > SERVO_ANGLE_270_MAX)
+  {
+    angleDeg = SERVO_ANGLE_270_MAX;
+  }
+
+  if ((int16_t)angleDeg != *lastAppliedAngle)
+  {
+    (void)ServoSetAngle270ByChannel(channel, angleDeg);
+    *lastAppliedAngle = (int16_t)angleDeg;
+  }
+}
+
+static int16_t MoveAngleTowardTarget(int16_t currentAngle,
+                                     int16_t targetAngle,
+                                     uint16_t maxStepDeg)
+{
+  if (maxStepDeg == 0U || currentAngle == targetAngle)
+  {
+    return currentAngle;
+  }
+
+  if (currentAngle < targetAngle)
+  {
+    int32_t nextAngle = (int32_t)currentAngle + (int32_t)maxStepDeg;
+    if (nextAngle > (int32_t)targetAngle)
+    {
+      nextAngle = (int32_t)targetAngle;
+    }
+    return (int16_t)nextAngle;
+  }
+
+  {
+    int32_t nextAngle = (int32_t)currentAngle - (int32_t)maxStepDeg;
+    if (nextAngle < (int32_t)targetAngle)
+    {
+      nextAngle = (int32_t)targetAngle;
+    }
+    return (int16_t)nextAngle;
+  }
+}
+
+static void ServoStateTransitionStep(void)
+{
+  uint32_t nowTick;
+  uint32_t elapsedMs;
+  uint32_t stepDeg;
+  int16_t nextAngle;
+
+  nowTick = HAL_GetTick();
+  elapsedMs = nowTick - stateTransitionLastTick;
+  if (elapsedMs < SERVO_STATE_TRANSITION_PERIOD_MS)
+  {
+    return;
+  }
+  stateTransitionLastTick = nowTick;
+
+  stepDeg = ((uint32_t)SERVO_STATE_TRANSITION_SPEED_DPS * elapsedMs + 999U) / 1000U;
+  if (stepDeg == 0U)
+  {
+    stepDeg = 1U;
+  }
+
+  if (stateTargetGimbal >= 0 && gimbalLastApplied >= 0)
+  {
+    nextAngle = MoveAngleTowardTarget(gimbalLastApplied, stateTargetGimbal, (uint16_t)stepDeg);
+    ApplyStateServoAngle270(SERVO_CH_GIMBAL, (uint16_t)nextAngle, &gimbalLastApplied);
+    if (nextAngle == stateTargetGimbal)
+    {
+      stateTargetGimbal = SERVO_STATE_TARGET_INVALID;
+    }
+  }
+
+  if (stateTargetUpper >= 0 && upperLastApplied >= 0)
+  {
+    nextAngle = MoveAngleTowardTarget(upperLastApplied, stateTargetUpper, (uint16_t)stepDeg);
+    ApplyStateServoAngle180(SERVO_CH_UPPER, (uint16_t)nextAngle, &upperLastApplied, &upperSliderLpf);
+    if (nextAngle == stateTargetUpper)
+    {
+      stateTargetUpper = SERVO_STATE_TARGET_INVALID;
+    }
+  }
+
+  if (stateTargetMiddle >= 0 && middleLastApplied >= 0)
+  {
+    nextAngle = MoveAngleTowardTarget(middleLastApplied, stateTargetMiddle, (uint16_t)stepDeg);
+    ApplyStateServoAngle180(SERVO_CH_MIDDLE, (uint16_t)nextAngle, &middleLastApplied, &middleSliderLpf);
+    if (nextAngle == stateTargetMiddle)
+    {
+      stateTargetMiddle = SERVO_STATE_TARGET_INVALID;
+    }
+  }
+
+  if (stateTargetLower >= 0 && lowerLastApplied >= 0)
+  {
+    nextAngle = MoveAngleTowardTarget(lowerLastApplied, stateTargetLower, (uint16_t)stepDeg);
+    ApplyStateServoAngle180(SERVO_CH_LOWER, (uint16_t)nextAngle, &lowerLastApplied, &lowerSliderLpf);
+    if (nextAngle == stateTargetLower)
+    {
+      stateTargetLower = SERVO_STATE_TARGET_INVALID;
+    }
+  }
+
+  if (stateTargetFlower >= 0 && flowerLastApplied >= 0)
+  {
+    nextAngle = MoveAngleTowardTarget(flowerLastApplied, stateTargetFlower, (uint16_t)stepDeg);
+    ApplyStateServoAngle180(SERVO_CH_FLOWER, (uint16_t)nextAngle, &flowerLastApplied, NULL);
+    flowerAngle_mdeg = (int32_t)flowerLastApplied * 1000;
+    if (nextAngle == stateTargetFlower)
+    {
+      stateTargetFlower = SERVO_STATE_TARGET_INVALID;
+    }
+  }
+
+  if (stateTargetClamp >= 0 && clampLastApplied >= 0)
+  {
+    nextAngle = MoveAngleTowardTarget(clampLastApplied, stateTargetClamp, (uint16_t)stepDeg);
+    ApplyStateServoAngle180(SERVO_CH_CLAMP, (uint16_t)nextAngle, &clampLastApplied, NULL);
+    if (nextAngle == stateTargetClamp)
+    {
+      stateTargetClamp = SERVO_STATE_TARGET_INVALID;
+    }
+  }
+
+  if (stateTargetTrunk >= 0 && trunkLastApplied >= 0)
+  {
+    nextAngle = MoveAngleTowardTarget(trunkLastApplied, stateTargetTrunk, (uint16_t)stepDeg);
+    ApplyStateServoAngle180(SERVO_CH_TRUNK, (uint16_t)nextAngle, &trunkLastApplied, NULL);
+    if (nextAngle == stateTargetTrunk)
+    {
+      stateTargetTrunk = SERVO_STATE_TARGET_INVALID;
+    }
+  }
+}
+
+static void ApplyServoStatePreset(const ServoStatePreset_t *preset)
+{
+  if (preset == NULL)
+  {
+    return;
+  }
+
+  if (preset->gimbalAngleDeg != SERVO_STATE_KEEP_ANGLE)
+  {
+    uint16_t target = preset->gimbalAngleDeg;
+    if (target > SERVO_ANGLE_270_MAX)
+    {
+      target = SERVO_ANGLE_270_MAX;
+    }
+    stateTargetGimbal = (int16_t)target;
+  }
+  else
+  {
+    stateTargetGimbal = SERVO_STATE_TARGET_INVALID;
+  }
+
+  if (preset->upperAngleDeg != SERVO_STATE_KEEP_ANGLE)
+  {
+    uint16_t target = preset->upperAngleDeg;
+    if (target > SERVO_ANGLE_180_MAX)
+    {
+      target = SERVO_ANGLE_180_MAX;
+    }
+    stateTargetUpper = (int16_t)target;
+  }
+  else
+  {
+    stateTargetUpper = SERVO_STATE_TARGET_INVALID;
+  }
+
+  if (preset->middleAngleDeg != SERVO_STATE_KEEP_ANGLE)
+  {
+    uint16_t target = preset->middleAngleDeg;
+    if (target > SERVO_ANGLE_180_MAX)
+    {
+      target = SERVO_ANGLE_180_MAX;
+    }
+    stateTargetMiddle = (int16_t)target;
+  }
+  else
+  {
+    stateTargetMiddle = SERVO_STATE_TARGET_INVALID;
+  }
+
+  if (preset->lowerAngleDeg != SERVO_STATE_KEEP_ANGLE)
+  {
+    uint16_t target = preset->lowerAngleDeg;
+    if (target > SERVO_ANGLE_180_MAX)
+    {
+      target = SERVO_ANGLE_180_MAX;
+    }
+    stateTargetLower = (int16_t)target;
+  }
+  else
+  {
+    stateTargetLower = SERVO_STATE_TARGET_INVALID;
+  }
+
+  if (preset->flowerAngleDeg != SERVO_STATE_KEEP_ANGLE)
+  {
+    uint16_t target = preset->flowerAngleDeg;
+    if (target > SERVO_ANGLE_180_MAX)
+    {
+      target = SERVO_ANGLE_180_MAX;
+    }
+    flowerRunning = 0U;
+    flowerDir = 0;
+    stateTargetFlower = (int16_t)target;
+  }
+  else
+  {
+    stateTargetFlower = SERVO_STATE_TARGET_INVALID;
+  }
+
+  if (preset->clampAngleDeg != SERVO_STATE_KEEP_ANGLE)
+  {
+    uint16_t target = preset->clampAngleDeg;
+    if (target > SERVO_ANGLE_180_MAX)
+    {
+      target = SERVO_ANGLE_180_MAX;
+    }
+    stateTargetClamp = (int16_t)target;
+  }
+  else
+  {
+    stateTargetClamp = SERVO_STATE_TARGET_INVALID;
+  }
+
+  if (preset->trunkAngleDeg != SERVO_STATE_KEEP_ANGLE)
+  {
+    uint16_t target = preset->trunkAngleDeg;
+    if (target > SERVO_ANGLE_180_MAX)
+    {
+      target = SERVO_ANGLE_180_MAX;
+    }
+    stateTargetTrunk = (int16_t)target;
+  }
+  else
+  {
+    stateTargetTrunk = SERVO_STATE_TARGET_INVALID;
+  }
+}
+
+static void ProcessStatePacket(const char *buf)
+{
+  const char *p = buf;
+  int16_t stateIdRaw;
+  const ServoStatePreset_t *preset;
+
+  if (p == NULL || p[0] != '(')
+  {
+    return;
+  }
+
+  p++;
+  if (ParseSignedInt16Fast(&p, &stateIdRaw) == 0U || *p != ')' || p[1] != '\0')
+  {
+    return;
+  }
+
+  if (stateIdRaw < 0)
+  {
+    return;
+  }
+
+  preset = FindServoStatePreset((uint16_t)stateIdRaw);
+  if (preset == NULL)
+  {
+    return;
+  }
+
+  ApplyServoStatePreset(preset);
+}
+
 static void ProcessLatestUartFrame(void)
 {
   char frame[UART_FRAME_BUF_SIZE];
@@ -517,6 +918,17 @@ static void ProcessLatestUartFrame(void)
   frame[frameLen] = '\0';
   uart_latest_ready = 0;
   __enable_irq();
+
+  if (frameLen < 3U || frame[0] == '\0')
+  {
+    return;
+  }
+
+  if (frame[0] == '(')
+  {
+    ProcessStatePacket(frame);
+    return;
+  }
 
   if (frameLen < 4U || frame[0] != '[' || frame[1] == '\0')
   {
@@ -903,6 +1315,7 @@ int main(void)
   trunkLastApplied = TRUNK_RETRACT_ANGLE;
 
   mecanumLateralCmd = 0;
+  stateTransitionLastTick = HAL_GetTick();
   StartUartReceive();
   
 
@@ -943,9 +1356,19 @@ int main(void)
     }
 
     ApplyMecanumLateralCommand(mecanumLateralCmd, applyLeftPct, applyRightPct);
-    ServoSliderApplySmoothedAngle180(SERVO_CH_UPPER, &upperSliderLpf, &upperLastApplied);
-    ServoSliderApplySmoothedAngle180(SERVO_CH_MIDDLE, &middleSliderLpf, &middleLastApplied);
-    ServoSliderApplySmoothedAngle180(SERVO_CH_LOWER, &lowerSliderLpf, &lowerLastApplied);
+    ServoStateTransitionStep();
+    if (stateTargetUpper == SERVO_STATE_TARGET_INVALID)
+    {
+      ServoSliderApplySmoothedAngle180(SERVO_CH_UPPER, &upperSliderLpf, &upperLastApplied);
+    }
+    if (stateTargetMiddle == SERVO_STATE_TARGET_INVALID)
+    {
+      ServoSliderApplySmoothedAngle180(SERVO_CH_MIDDLE, &middleSliderLpf, &middleLastApplied);
+    }
+    if (stateTargetLower == SERVO_STATE_TARGET_INVALID)
+    {
+      ServoSliderApplySmoothedAngle180(SERVO_CH_LOWER, &lowerSliderLpf, &lowerLastApplied);
+    }
     FlowerHandSyncStep();
     SpeedA = applyLeftPct;
     SpeedB = applyRightPct;
@@ -1165,6 +1588,7 @@ static void ProcessServoPacket(char *buf)
 
   if (servoId == SERVO_SLIDER_GIMBAL_ID)
   {
+    stateTargetGimbal = SERVO_STATE_TARGET_INVALID;
     targetAngle = (inputVal < 0) ? 0 : (int16_t)inputVal;
 
     if (targetAngle > (int16_t)SERVO_ANGLE_270_MAX)
@@ -1182,6 +1606,7 @@ static void ProcessServoPacket(char *buf)
 
   if (servoId == SERVO_SLIDER_UPPER_ID)
   {
+    stateTargetUpper = SERVO_STATE_TARGET_INVALID;
     UpdateServo180ByFilteredSliderInput(SERVO_CH_UPPER,
                                       inputVal,
                                       &upperSliderLpf,
@@ -1191,6 +1616,7 @@ static void ProcessServoPacket(char *buf)
 
   if (servoId == SERVO_SLIDER_MIDDLE_ID)
   {
+    stateTargetMiddle = SERVO_STATE_TARGET_INVALID;
     UpdateServo180ByFilteredSliderInput(SERVO_CH_MIDDLE,
                                       inputVal,
                                       &middleSliderLpf,
@@ -1200,6 +1626,7 @@ static void ProcessServoPacket(char *buf)
 
   if (servoId == SERVO_SLIDER_LOWER_ID)
   {
+    stateTargetLower = SERVO_STATE_TARGET_INVALID;
     UpdateServo180ByFilteredSliderInput(SERVO_CH_LOWER,
                                       inputVal,
                                       &lowerSliderLpf,
@@ -1228,6 +1655,7 @@ static void ProcessServoFinalPacket(char *buf)
 
   if (servoId == SERVO_SLIDER_UPPER_ID)
   {
+    stateTargetUpper = SERVO_STATE_TARGET_INVALID;
     UpdateServo180ByFinalSliderInput(SERVO_CH_UPPER,
                                    inputVal,
                                    &upperSliderLpf,
@@ -1237,6 +1665,7 @@ static void ProcessServoFinalPacket(char *buf)
 
   if (servoId == SERVO_SLIDER_MIDDLE_ID)
   {
+    stateTargetMiddle = SERVO_STATE_TARGET_INVALID;
     UpdateServo180ByFinalSliderInput(SERVO_CH_MIDDLE,
                                    inputVal,
                                    &middleSliderLpf,
@@ -1246,6 +1675,7 @@ static void ProcessServoFinalPacket(char *buf)
 
   if (servoId == SERVO_SLIDER_LOWER_ID)
   {
+    stateTargetLower = SERVO_STATE_TARGET_INVALID;
     UpdateServo180ByFinalSliderInput(SERVO_CH_LOWER,
                                    inputVal,
                                    &lowerSliderLpf,
@@ -1288,6 +1718,7 @@ static void ProcessDualServoPacket(char *buf)
 
   if (moveCmd == 'u')
   {
+    stateTargetClamp = SERVO_STATE_TARGET_INVALID;
     if (clampLastApplied != CLAMP_CLOSE_ANGLE)
     {
       (void)ServoSetAngle180ByChannel(SERVO_CH_CLAMP, (uint16_t)CLAMP_CLOSE_ANGLE);
@@ -1298,6 +1729,7 @@ static void ProcessDualServoPacket(char *buf)
 
   if (moveCmd == 'd')
   {
+    stateTargetClamp = SERVO_STATE_TARGET_INVALID;
     if (clampLastApplied != CLAMP_OPEN_ANGLE)
     {
       (void)ServoSetAngle180ByChannel(SERVO_CH_CLAMP, (uint16_t)CLAMP_OPEN_ANGLE);
@@ -1308,6 +1740,7 @@ static void ProcessDualServoPacket(char *buf)
 
   if (moveCmd == 'i')
   {
+    stateTargetTrunk = SERVO_STATE_TARGET_INVALID;
     if (trunkLastApplied != TRUNK_RETRACT_ANGLE)
     {
       (void)ServoSetAngle180ByChannel(SERVO_CH_TRUNK, (uint16_t)TRUNK_RETRACT_ANGLE);
@@ -1318,6 +1751,7 @@ static void ProcessDualServoPacket(char *buf)
 
   if (moveCmd == 'o')
   {
+    stateTargetTrunk = SERVO_STATE_TARGET_INVALID;
     if (trunkLastApplied != TRUNK_OPEN_ANGLE)
     {
       (void)ServoSetAngle180ByChannel(SERVO_CH_TRUNK, (uint16_t)TRUNK_OPEN_ANGLE);
@@ -1328,6 +1762,7 @@ static void ProcessDualServoPacket(char *buf)
 
   if (moveCmd == 'q')
   {
+    stateTargetFlower = SERVO_STATE_TARGET_INVALID;
     flowerDir = 1;
     flowerRunning = 1;
     flowerLastTick = HAL_GetTick();
@@ -1336,6 +1771,7 @@ static void ProcessDualServoPacket(char *buf)
 
   if (moveCmd == 'e')
   {
+    stateTargetFlower = SERVO_STATE_TARGET_INVALID;
     flowerDir = -1;
     flowerRunning = 1;
     flowerLastTick = HAL_GetTick();
@@ -1349,10 +1785,11 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
   {
     uint8_t byte = rx_data;
 
-    if (byte == '[')
+    if (byte == '[' || byte == '(')
     {
-      uart_in_frame = 1;
-      uart_rx_idx = 0;
+      uart_in_frame = 1U;
+      uart_rx_idx = 0U;
+      uart_frame_end = (byte == '[') ? (uint8_t)']' : (uint8_t)')';
     }
 
     if (uart_in_frame)
@@ -1362,7 +1799,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         uart_rx_buf[uart_rx_idx++] = (char)byte;
         uart_rx_buf[uart_rx_idx] = '\0';
 
-        if (byte == ']')
+        if (byte == uart_frame_end)
         {
           uint8_t frameLen = uart_rx_idx;
           if (frameLen >= (uint8_t)sizeof(uart_latest_frame))
@@ -1375,6 +1812,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
           uart_latest_ready = 1U;
           uart_in_frame = 0;
           uart_rx_idx = 0;
+          uart_frame_end = 0U;
           uart_rx_buf[0] = '\0';
         }
       }
@@ -1382,6 +1820,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
       {
         uart_in_frame = 0;
         uart_rx_idx = 0;
+        uart_frame_end = 0U;
         uart_rx_buf[0] = '\0';
       }
     }
@@ -1397,6 +1836,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   {
     uart_in_frame = 0U;
     uart_rx_idx = 0U;
+    uart_frame_end = 0U;
     uart_rx_buf[0] = '\0';
     StartUartReceive();
   }
