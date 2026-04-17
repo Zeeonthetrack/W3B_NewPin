@@ -85,7 +85,7 @@ typedef struct
 #define SERVO_SLIDER_LPF_ALPHA_LOWER 0.08f
 
 #define SERVO_SLIDER_GIMBAL_ID 1
-#define SERVO_SLIDER_SPEED_ID 2
+#define SERVO_SLIDER_SPEED_ID 0
 #define SERVO_SLIDER_UPPER_ID 3
 #define SERVO_SLIDER_MIDDLE_ID 4
 #define SERVO_SLIDER_LOWER_ID 5
@@ -100,7 +100,7 @@ typedef struct
 
 #define FLOWER_MIN_ANGLE 0
 #define FLOWER_MAX_ANGLE 90
-#define FLOWER_INIT_ANGLE 0
+#define FLOWER_INIT_ANGLE 90
 #define FLOWER_SPEED_DEG_PER_SEC 30
 #define FLOWER_STEP_PERIOD_MS 20U
 
@@ -1572,7 +1572,7 @@ static void ProcessJoystickPacket(char *buf)
 }
 
 /* Parse process packet [s,id,x]:
- * id=1 -> gimbal angle (CH9, 0~270), id=2 -> speed percent,
+ * id=1 -> gimbal angle (CH9, 0~270), id=0 -> speed percent,
  * id=3/4/5 -> upper/middle/lower slider input value.
  */
 static void ProcessServoPacket(char *buf)
