@@ -51,8 +51,8 @@ typedef struct
 /* Encoder calibration: left motor max measured speed in counts per second. */
 #define LEFT_ENCODER_MAX_CPS 9400
 #define RIGHT_ENCODER_MAX_CPS 9400
-#define JOY_Y_ACTIVE_THRESHOLD_PCT 75
-#define JOY_X_ACTIVE_THRESHOLD_PCT 80
+#define JOY_Y_ACTIVE_THRESHOLD_PCT 60
+#define JOY_X_ACTIVE_THRESHOLD_PCT 60
 #define JOY_TIMEOUT_MS 500U
 #define UART_FRAME_BUF_SIZE 64U
 
@@ -69,6 +69,8 @@ typedef struct
 #define SERVO_SLIDER_INPUT_MAX 180U
 /* 0~1: smaller alpha gives smoother but slower response. */
 #define SERVO_SLIDER_LPF_ALPHA 0.18f
+/* Lower arm servo: stronger smoothing for slower, steadier convergence. */
+#define SERVO_SLIDER_LPF_ALPHA_LOWER 0.08f
 
 #define SERVO_SLIDER_GIMBAL_ID 1
 #define SERVO_SLIDER_SPEED_ID 2
@@ -86,12 +88,12 @@ typedef struct
 
 #define FLOWER_MIN_ANGLE 0
 #define FLOWER_MAX_ANGLE 90
-#define FLOWER_INIT_ANGLE 45
-#define FLOWER_SPEED_DEG_PER_SEC 20
+#define FLOWER_INIT_ANGLE 0
+#define FLOWER_SPEED_DEG_PER_SEC 30
 #define FLOWER_STEP_PERIOD_MS 20U
 
 #define CLAMP_CLOSE_ANGLE 100
-#define CLAMP_OPEN_ANGLE 33
+#define CLAMP_OPEN_ANGLE 20
 #define TRUNK_RETRACT_ANGLE 33
 #define TRUNK_OPEN_ANGLE 120
 
@@ -103,7 +105,7 @@ typedef struct
 /* Mecanum lateral speed ratio: strafe = forward/backward * 3/4. */
 #define K_MECANUM_LATERAL_SCALE_NUM 3
 #define K_MECANUM_LATERAL_SCALE_DEN 4
-#define K_FB_LOW_SPEED_DIRECT_THRESHOLD_PCT 30
+#define K_FB_LOW_SPEED_DIRECT_THRESHOLD_PCT 60
 
 /* USER CODE END PD */
 
@@ -374,12 +376,16 @@ static HAL_StatusTypeDef ServoSetAngle180ByChannel(uint8_t channel, uint16_t ang
 static HAL_StatusTypeDef ServoSetAngle270ByChannel(uint8_t channel, uint16_t angleDeg);
 static HAL_StatusTypeDef ServoSetPulseUsByChannel(uint8_t channel, uint16_t pulseUs);
 static uint16_t ClampServoSliderInputRaw(int16_t inputRaw);
-static uint16_t ServoSliderLowPassUpdate(ServoSliderLpfState_t *state);
+static uint16_t ServoSliderLowPassUpdate(ServoSliderLpfState_t *state, float alpha);
 static uint16_t ServoSliderInputToAngle180(uint16_t inputRaw);
 static uint16_t ServoSliderAngle180ToInput(uint16_t angleDeg);
 static void ServoSliderSetTargetInput(ServoSliderLpfState_t *state,
                                       int16_t inputRaw,
                                       int16_t currentAngleDeg);
+static void ServoSliderApplySmoothedAngle180WithAlpha(uint8_t channel,
+                                                      ServoSliderLpfState_t *state,
+                                                      int16_t *lastAppliedAngle,
+                                                      float alpha);
 static void ServoSliderApplySmoothedAngle180(uint8_t channel,
                                              ServoSliderLpfState_t *state,
                                              int16_t *lastAppliedAngle);
@@ -601,9 +607,8 @@ static uint16_t ClampServoSliderInputRaw(int16_t inputRaw)
   return (uint16_t)inputRaw;
 }
 
-static uint16_t ServoSliderLowPassUpdate(ServoSliderLpfState_t *state)
+static uint16_t ServoSliderLowPassUpdate(ServoSliderLpfState_t *state, float alpha)
 {
-  float alpha = SERVO_SLIDER_LPF_ALPHA;
   float filtered;
 
   if (state == NULL || state->initialized == 0U)
@@ -709,6 +714,18 @@ static void ServoSliderApplySmoothedAngle180(uint8_t channel,
                                              ServoSliderLpfState_t *state,
                                              int16_t *lastAppliedAngle)
 {
+  ServoSliderApplySmoothedAngle180WithAlpha(
+    channel,
+    state,
+    lastAppliedAngle,
+    SERVO_SLIDER_LPF_ALPHA);
+}
+
+static void ServoSliderApplySmoothedAngle180WithAlpha(uint8_t channel,
+                                                      ServoSliderLpfState_t *state,
+                                                      int16_t *lastAppliedAngle,
+                                                      float alpha)
+{
   uint16_t inputRawFiltered;
   uint16_t targetAngle;
 
@@ -717,7 +734,7 @@ static void ServoSliderApplySmoothedAngle180(uint8_t channel,
     return;
   }
 
-  inputRawFiltered = ServoSliderLowPassUpdate(state);
+  inputRawFiltered = ServoSliderLowPassUpdate(state, alpha);
   targetAngle = ServoSliderInputToAngle180(inputRawFiltered);
 
   if ((int16_t)targetAngle != *lastAppliedAngle)
@@ -945,7 +962,11 @@ int main(void)
     ApplyMecanumLateralCommand(mecanumLateralCmd, applyLeftPct, applyRightPct);
     ServoSliderApplySmoothedAngle180(SERVO_CH_UPPER, &upperSliderLpf, &upperLastApplied);
     ServoSliderApplySmoothedAngle180(SERVO_CH_MIDDLE, &middleSliderLpf, &middleLastApplied);
-    ServoSliderApplySmoothedAngle180(SERVO_CH_LOWER, &lowerSliderLpf, &lowerLastApplied);
+    ServoSliderApplySmoothedAngle180WithAlpha(
+      SERVO_CH_LOWER,
+      &lowerSliderLpf,
+      &lowerLastApplied,
+      SERVO_SLIDER_LPF_ALPHA_LOWER);
     FlowerHandSyncStep();
     SpeedA = applyLeftPct;
     SpeedB = applyRightPct;
